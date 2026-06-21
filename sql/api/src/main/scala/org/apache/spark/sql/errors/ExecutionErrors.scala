@@ -53,6 +53,12 @@ private[sql] trait ExecutionErrors extends DataTypeErrorsBase {
       e)
   }
 
+  def nanosTimestampUnsupportedWithLegacyParserError(): SparkUnsupportedOperationException = {
+    new SparkUnsupportedOperationException(
+      errorClass = "UNSUPPORTED_FEATURE.TIMESTAMP_NANOS_WITH_LEGACY_TIME_PARSER",
+      messageParameters = Map("config" -> toSQLConf(SqlApiConf.LEGACY_TIME_PARSER_POLICY_KEY)))
+  }
+
   def stateStoreHandleNotInitialized(): SparkRuntimeException = {
     new SparkRuntimeException(
       errorClass = "STATE_STORE_HANDLE_NOT_INITIALIZED",
@@ -125,7 +131,10 @@ private[sql] trait ExecutionErrors extends DataTypeErrorsBase {
       // but throws a pre-allocated exception object without a stack trace
       // or message. See https://bugs.openjdk.org/browse/JDK-8367990
       case null => "overflow"
-      case m if m.contains("overflow") => "overflow"
+      // JDK throws messages like "integer overflow", "long overflow", etc.
+      // Only canonicalize these simple "<type> overflow" patterns to avoid
+      // stripping context from richer messages.
+      case m if m.matches("\\w+ overflow") => "overflow"
       case m => m
     }
     val alternative = if (suggestedFunc.nonEmpty) {

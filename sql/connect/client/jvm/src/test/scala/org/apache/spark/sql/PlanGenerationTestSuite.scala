@@ -393,6 +393,21 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     session.table("myTable")
   }
 
+  test("read changes") {
+    session.read
+      .option("startingVersion", "1")
+      .option("endingVersion", "5")
+      .changes("myTable")
+  }
+
+  test("read changes with options") {
+    session.read
+      .option("startingTimestamp", "2026-01-01")
+      .option("deduplicationMode", "dropCarryovers")
+      .option("computeUpdates", "true")
+      .changes("myTable")
+  }
+
   test("read text") {
     session.read.text(testDataPath.resolve("people.txt").toString)
   }
@@ -499,6 +514,29 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   test("crossJoin") {
     left.crossJoin(right)
+  }
+
+  test("nearestByJoin inner_approx_similarity") {
+    left
+      .as("l")
+      .nearestByJoin(
+        right = right.as("r"),
+        rankingExpression = fn.col("l.a") + fn.col("r.a"),
+        numResults = 1,
+        mode = "approx",
+        direction = "similarity")
+  }
+
+  test("nearestByJoin leftouter_exact_distance") {
+    left
+      .as("l")
+      .nearestByJoin(
+        right = right.as("r"),
+        rankingExpression = fn.col("l.a") + fn.col("r.a"),
+        numResults = 5,
+        mode = "exact",
+        direction = "distance",
+        joinType = "leftouter")
   }
 
   test("sortWithinPartitions strings") {
@@ -698,6 +736,10 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     val builder = new MetadataBuilder
     builder.putString("description", "unique identifier")
     simple.withMetadata("id", builder.build())
+  }
+
+  test("zip") {
+    left.select("id").zip(left.select("a"))
   }
 
   test("zipWithIndex") {
@@ -2713,6 +2755,14 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
     fn.is_variant_null(fn.parse_json(fn.col("g")))
   }
 
+  functionTest("is_valid_variant") {
+    fn.is_valid_variant(fn.parse_json(fn.col("g")))
+  }
+
+  functionTest("variant_delete") {
+    fn.variant_delete(fn.parse_json(fn.col("g")), "$.a", "$.b")
+  }
+
   functionTest("variant_get") {
     fn.variant_get(fn.parse_json(fn.col("g")), "$", "int")
   }
@@ -3544,6 +3594,13 @@ class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
   /* Stream Reader API  */
   test("streaming table API with options") {
     session.readStream.options(Map("p1" -> "v1", "p2" -> "v2")).table("tempdb.myStreamingTable")
+  }
+
+  test("streaming changes API with options") {
+    session.readStream
+      .option("startingVersion", "1")
+      .option("deduplicationMode", "dropCarryovers")
+      .changes("tempdb.myStreamingTable")
   }
 
   /* Avro functions */

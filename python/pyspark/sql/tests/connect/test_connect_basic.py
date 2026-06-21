@@ -45,7 +45,6 @@ from pyspark.testing.connectutils import (
 )
 from pyspark.testing.pandasutils import PandasOnSparkTestUtils
 
-
 if should_test_connect:
     from pyspark.sql.connect.proto import ExecutePlanResponse, Expression as ProtoExpression
     from pyspark.sql.connect.column import Column
@@ -249,8 +248,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column, int, list, str or tuple",
                 "arg_name": "item",
                 "arg_type": "float",
             },
@@ -261,8 +261,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column, int, list, str or tuple",
                 "arg_name": "item",
                 "arg_type": "NoneType",
             },
@@ -273,8 +274,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT_OR_LIST_OR_STR_OR_TUPLE",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column, int, list, str or tuple",
                 "arg_name": "item",
                 "arg_type": "DataFrame",
             },
@@ -952,8 +954,12 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OF_COLUMN",
-            messageParameters={"arg_name": "exprs"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list[Column]",
+                "arg_name": "exprs",
+                "arg_type": "tuple",
+            },
         )
 
     def test_with_columns(self):
@@ -1271,8 +1277,9 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DICT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "dict",
                 "arg_name": "metadata",
                 "arg_type": "list",
             },
@@ -1477,7 +1484,7 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
         self.connect.range(1).count()
         default_plan_compression_threshold = self.connect._client._plan_compression_threshold
         self.assertTrue(default_plan_compression_threshold > 0)
-        self.assertTrue(self.connect._client._plan_compression_algorithm == "ZSTD")
+        self.assertEqual(self.connect._client._plan_compression_algorithm, "ZSTD")
         try:
             self.connect._client._plan_compression_threshold = 1000
 
@@ -1485,17 +1492,17 @@ class SparkConnectBasicTests(SparkConnectSQLTestCase):
             cdf1 = self.connect.range(1).select(CF.lit("Apache Spark"))
             plan1 = cdf1._plan.to_proto(self.connect._client)
             self.assertTrue(plan1.root is not None)
-            self.assertTrue(cdf1.count() == 1)
+            self.assertEqual(cdf1.count(), 1)
 
             # Large plan should be compressed
             cdf2 = self.connect.range(1).select(CF.lit("Apache Spark" * 1000))
             plan2 = cdf2._plan.to_proto(self.connect._client)
             self.assertTrue(plan2.compressed_operation is not None)
             # Test compressed relation
-            self.assertTrue(cdf2.count() == 1)
+            self.assertEqual(cdf2.count(), 1)
             # Test compressed command
             cdf2.createOrReplaceTempView("temp_view_cdf2")
-            self.assertTrue(self.connect.sql("SELECT * FROM temp_view_cdf2").count() == 1)
+            self.assertEqual(self.connect.sql("SELECT * FROM temp_view_cdf2").count(), 1)
         finally:
             self.connect._client._plan_compression_threshold = default_plan_compression_threshold
 

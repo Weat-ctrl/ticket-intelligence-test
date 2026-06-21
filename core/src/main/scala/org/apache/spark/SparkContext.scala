@@ -455,7 +455,7 @@ class SparkContext(config: SparkConf) extends Logging {
     // Set Spark driver host and port system properties. This explicitly sets the configuration
     // instead of relying on the default value of the config constant.
     if (SparkMasterRegex.isK8s(master) &&
-        _conf.getBoolean("spark.kubernetes.executor.useDriverPodIP", false)) {
+        _conf.getBoolean("spark.kubernetes.executor.useDriverPodIP", true)) {
       logInfo("Use DRIVER_BIND_ADDRESS instead of DRIVER_HOST_ADDRESS as driver address " +
         "because spark.kubernetes.executor.useDriverPodIP is true in K8s mode.")
       _conf.set(DRIVER_HOST_ADDRESS, _conf.get(DRIVER_BIND_ADDRESS))
@@ -754,7 +754,7 @@ class SparkContext(config: SparkConf) extends Logging {
    */
   private[spark] def getExecutorThreadDump(executorId: String): Option[Array[ThreadStackTrace]] = {
     try {
-      if (executorId == SparkContext.DRIVER_IDENTIFIER) {
+      if (SparkContext.isDriver(executorId)) {
         Some(Utils.getThreadDump())
       } else {
         env.blockManager.master.getExecutorEndpointRef(executorId) match {
@@ -786,7 +786,7 @@ class SparkContext(config: SparkConf) extends Logging {
    */
   private[spark] def getExecutorHeapHistogram(executorId: String): Option[Array[String]] = {
     try {
-      if (executorId == SparkContext.DRIVER_IDENTIFIER) {
+      if (SparkContext.isDriver(executorId)) {
         Some(Utils.getHeapHistogram())
       } else {
         env.blockManager.master.getExecutorEndpointRef(executorId) match {
@@ -3152,6 +3152,8 @@ object SparkContext extends Logging {
   private[spark] val RDD_SCOPE_KEY = "spark.rdd.scope"
   private[spark] val RDD_SCOPE_NO_OVERRIDE_KEY = "spark.rdd.scope.noOverride"
   private[spark] val SQL_EXECUTION_ID_KEY = "spark.sql.execution.id"
+  private[spark] val DATASET_QUERY_EXECUTION_ID_KEY =
+    "spark.sql.dataset.queryExecution.id"
 
   /**
    * Executor id for the driver.  In earlier versions of Spark, this was `<driver>`, but this was
@@ -3162,6 +3164,11 @@ object SparkContext extends Logging {
 
   /** Separator of tags in SPARK_JOB_TAGS property */
   private[spark] val SPARK_JOB_TAGS_SEP = ","
+
+  /** Returns true if the given executor ID identifies the driver. */
+  private[spark] def isDriver(executorId: String): Boolean = {
+    DRIVER_IDENTIFIER == executorId
+  }
 
   // Same rules apply to Spark Connect execution tags, see ExecuteHolder.throwIfInvalidTag
   private[spark] def throwIfInvalidTag(tag: String) = {

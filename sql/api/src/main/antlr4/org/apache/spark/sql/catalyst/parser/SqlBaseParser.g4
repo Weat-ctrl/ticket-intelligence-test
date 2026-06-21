@@ -78,7 +78,7 @@ options { tokenVocab = SqlBaseLexer; }
            la == ANTI || la == JOIN || la == UNION || la == EXCEPT ||
            la == SETMINUS || la == INTERSECT || la == ORDER || la == CLUSTER ||
            la == DISTRIBUTE || la == SORT || la == LIMIT || la == OFFSET ||
-           la == AGGREGATE || la == WINDOW || la == LATERAL;
+           la == AGGREGATE || la == WINDOW || la == LATERAL || la == BIN;
   }
 }
 
@@ -217,6 +217,10 @@ singleTableSchema
     : colTypeList EOF
     ;
 
+singlePathElementList
+    : pathElement (COMMA pathElement)* EOF
+    ;
+
 singleRoutineParamList
     : colDefinitionList EOF
     ;
@@ -248,8 +252,8 @@ statement
     | createTableHeader (LEFT_PAREN tableElementList RIGHT_PAREN)? tableProvider?
         createTableClauses
         (AS? query)?                                                   #createTable
-    | CREATE TABLE (IF errorCapturingNot EXISTS)? target=tableIdentifier
-        LIKE source=tableIdentifier
+    | CREATE TABLE (IF errorCapturingNot EXISTS)? target=identifierReference
+        LIKE source=identifierReference
         (tableProvider |
         rowFormat |
         createFileFormat |
@@ -360,22 +364,23 @@ statement
     | EXPLAIN (LOGICAL | FORMATTED | EXTENDED | CODEGEN | COST)?
         (statement|setResetStatement)                                  #explain
     | SHOW TABLES ((FROM | IN) identifierReference)?
-        (LIKE? pattern=stringLit)?                                        #showTables
+        (LIKE? pattern=stringLit)? (AS JSON)?                            #showTables
     | SHOW TABLE EXTENDED ((FROM | IN) ns=identifierReference)?
-        LIKE pattern=stringLit partitionSpec?                             #showTableExtended
+        LIKE pattern=stringLit partitionSpec? (AS JSON)?                  #showTableExtended
     | SHOW TBLPROPERTIES table=identifierReference
         (LEFT_PAREN key=propertyKeyOrStringLit RIGHT_PAREN)?           #showTblProperties
     | SHOW COLUMNS (FROM | IN) table=identifierReference
         ((FROM | IN) ns=multipartIdentifier)?                          #showColumns
     | SHOW VIEWS ((FROM | IN) identifierReference)?
         (LIKE? pattern=stringLit)?                                        #showViews
-    | SHOW PARTITIONS identifierReference partitionSpec?               #showPartitions
+    | SHOW PARTITIONS identifierReference partitionSpec? (AS JSON)?    #showPartitions
     | SHOW functionScope=simpleIdentifier? FUNCTIONS ((FROM | IN) ns=identifierReference)?
         (LIKE? (legacy=multipartIdentifier | pattern=stringLit))?      #showFunctions
     | SHOW PROCEDURES ((FROM | IN) identifierReference)?               #showProcedures
     | SHOW CREATE TABLE identifierReference (AS SERDE)?                #showCreateTable
     | SHOW CURRENT namespace                                           #showCurrentNamespace
     | SHOW CATALOGS (LIKE? pattern=stringLit)?                            #showCatalogs
+    | SHOW COLLATIONS (LIKE? pattern=stringLit)?                          #showCollations
     | (DESC | DESCRIBE) FUNCTION EXTENDED? describeFuncName            #describeFunction
     | (DESC | DESCRIBE) PROCEDURE identifierReference                  #describeProcedure
     | (DESC | DESCRIBE) namespace EXTENDED?
@@ -431,8 +436,9 @@ createPipelineDatasetHeader
     ;
 
 streamRelationPrimary
-    : STREAM multipartIdentifier optionsClause?
-      identifiedByClause? watermarkClause? tableAlias                  #streamTableName
+    : STREAM multipartIdentifier streamChangesClause?
+      optionsClause? identifiedByClause?
+      watermarkClause? tableAlias                                      #streamTableName
     | STREAM LEFT_PAREN multipartIdentifier RIGHT_PAREN
       optionsClause? identifiedByClause?
       watermarkClause? tableAlias                                      #streamTableName
@@ -446,6 +452,7 @@ setResetStatement
     | SET TIME ZONE interval                                           #setTimeZone
     | SET TIME ZONE timezone                                           #setTimeZone
     | SET TIME ZONE .*?                                                #setTimeZone
+    | SET PATH EQ pathElement (COMMA pathElement)*                     #setPath
     | SET variable assignmentList                                      #setVariable
     | SET variable LEFT_PAREN multipartIdentifierList RIGHT_PAREN EQ
         LEFT_PAREN query RIGHT_PAREN                                   #setVariable
@@ -455,6 +462,15 @@ setResetStatement
     | SET .*?                                                          #setConfiguration
     | RESET configKey                                                  #resetQuotedConfiguration
     | RESET .*?                                                        #resetConfiguration
+    ;
+
+pathElement
+    : DEFAULT_PATH
+    | SYSTEM_PATH
+    | PATH
+    | CURRENT_DATABASE
+    | CURRENT_SCHEMA
+    | multipartIdentifier
     ;
 
 executeImmediate
@@ -573,7 +589,10 @@ query
 insertInto
     : INSERT (WITH SCHEMA EVOLUTION)? OVERWRITE TABLE? identifierReference optionsClause? (partitionSpec (IF errorCapturingNot EXISTS)?)?  ((BY NAME) | identifierList)? #insertOverwriteTable
     | INSERT (WITH SCHEMA EVOLUTION)? INTO TABLE? identifierReference optionsClause? partitionSpec? (IF errorCapturingNot EXISTS)? ((BY NAME) | identifierList)?   #insertIntoTable
-    | INSERT (WITH SCHEMA EVOLUTION)? INTO TABLE? identifierReference optionsClause? (BY NAME)? REPLACE whereClause              #insertIntoReplaceWhere
+    | INSERT (WITH SCHEMA EVOLUTION)? INTO TABLE? identifierReference tableAlias optionsClause? (BY NAME)?
+        REPLACE (WHERE | ON) replaceCondition=booleanExpression        #insertIntoReplaceBooleanCond
+    | INSERT (WITH SCHEMA EVOLUTION)? INTO TABLE? identifierReference tableAlias optionsClause? (BY NAME)?
+        REPLACE USING identifierList                                   #insertIntoReplaceUsing
     | INSERT OVERWRITE LOCAL? DIRECTORY path=stringLit rowFormat? createFileFormat?                     #insertOverwriteHiveDir
     | INSERT OVERWRITE LOCAL? DIRECTORY (path=stringLit)? tableProvider (OPTIONS options=propertyList)? #insertOverwriteDir
     ;
@@ -718,7 +737,7 @@ resource
     ;
 
 dmlStatementNoWith
-    : insertInto query                                                             #singleInsertQuery
+    : insertInto (query | LEFT_PAREN query RIGHT_PAREN queryAlias=tableAlias)      #singleInsertQuery
     | fromClause multiInsertQueryBody+                                             #multiInsertQuery
     | DELETE FROM identifierReference tableAlias whereClause?                      #deleteFromTable
     | UPDATE identifierReference tableAlias setClause whereClause?                 #updateTable
@@ -794,6 +813,7 @@ fromStatementBody
       aggregationClause?
       havingClause?
       windowClause?
+      qualifyClause?
       queryOrganization
     ;
 
@@ -811,7 +831,8 @@ querySpecification
       whereClause?
       aggregationClause?
       havingClause?
-      windowClause?                                                         #regularQuerySpecification
+      windowClause?
+      qualifyClause?                                                        #regularQuerySpecification
     ;
 
 transformClause
@@ -882,6 +903,10 @@ havingClause
     : HAVING booleanExpression
     ;
 
+qualifyClause
+    : QUALIFY booleanExpression
+    ;
+
 hint
     : HENT_START hintStatements+=hintStatement (COMMA? hintStatements+=hintStatement)* HENT_END
     ;
@@ -898,6 +923,20 @@ fromClause
 temporalClause
     : FOR? (SYSTEM_VERSION | VERSION) AS OF version
     | FOR? (SYSTEM_TIME | TIMESTAMP) AS OF timestamp=valueExpression
+    ;
+
+changesClause
+    : CHANGES FROM (SYSTEM_VERSION | VERSION) startingVersion=version (INCLUSIVE | startExclusive=EXCLUSIVE)?
+        (TO (SYSTEM_VERSION | VERSION) endingVersion=version (INCLUSIVE | endExclusive=EXCLUSIVE)?)?
+    | CHANGES FROM (SYSTEM_TIME | TIMESTAMP) startingTimestamp=valueExpression (INCLUSIVE | startExclusive=EXCLUSIVE)?
+        (TO (SYSTEM_TIME | TIMESTAMP) endingTimestamp=valueExpression (INCLUSIVE | endExclusive=EXCLUSIVE)?)?
+    ;
+
+// Like changesClause but startingVersion/startingTimestamp is optional (streaming can start
+// without an explicit starting point) and there is no ending bound (streaming is open-ended).
+streamChangesClause
+    : CHANGES (FROM (SYSTEM_VERSION | VERSION) startingVersion=version (INCLUSIVE | startExclusive=EXCLUSIVE)?)?
+    | CHANGES (FROM (SYSTEM_TIME | TIMESTAMP) startingTimestamp=valueExpression (INCLUSIVE | startExclusive=EXCLUSIVE)?)?
     ;
 
 aggregationClause
@@ -990,6 +1029,20 @@ unpivotAlias
     : AS? errorCapturingIdentifier
     ;
 
+binByClause
+    : BIN BY LEFT_PAREN
+        RANGE rangeStart=multipartIdentifier TO rangeEnd=multipartIdentifier
+        BIN WIDTH binWidth=expression
+        (ALIGN TO origin=expression)?
+        DISTRIBUTE UNIFORM LEFT_PAREN
+          distributeCol+=multipartIdentifier
+          (COMMA distributeCol+=multipartIdentifier)* RIGHT_PAREN
+        (BIN_START AS binStartAlias=errorCapturingIdentifier)?
+        (BIN_END AS binEndAlias=errorCapturingIdentifier)?
+        (BIN_DISTRIBUTE_RATIO AS binRatioAlias=errorCapturingIdentifier)?
+      RIGHT_PAREN (AS? tblAlias=errorCapturingIdentifier)?
+    ;
+
 lateralView
     : LATERAL VIEW (OUTER)? qualifiedName LEFT_PAREN (expression (COMMA expression)*)? RIGHT_PAREN tblName=identifier (AS? colName+=identifier (COMMA colName+=identifier)*)?
     ;
@@ -1011,10 +1064,11 @@ relationExtension
     : joinRelation
     | pivotClause
     | unpivotClause
+    | binByClause
     ;
 
 joinRelation
-    : (joinType) JOIN LATERAL? right=relationPrimary joinCriteria?
+    : (joinType) JOIN LATERAL? right=relationPrimary (joinCriteria | nearestByClause)?
     | NATURAL joinType JOIN LATERAL? right=relationPrimary
     ;
 
@@ -1033,8 +1087,14 @@ joinCriteria
     | USING identifierList
     ;
 
+nearestByClause
+    : (APPROX | EXACT) NEAREST num=INTEGER_VALUE? BY (DISTANCE | SIMILARITY) expression
+    ;
+
 sample
-    : TABLESAMPLE LEFT_PAREN sampleMethod? RIGHT_PAREN (REPEATABLE LEFT_PAREN seed=integerValue RIGHT_PAREN)?
+    : TABLESAMPLE (sampleType=(SYSTEM | BERNOULLI))?
+      LEFT_PAREN sampleMethod? RIGHT_PAREN
+      (REPEATABLE LEFT_PAREN seed=integerValue RIGHT_PAREN)?
     ;
 
 sampleMethod
@@ -1071,6 +1131,8 @@ identifierComment
 
 relationPrimary
     : streamRelationPrimary                                 #streamRelation
+    | identifierReference changesClause
+      optionsClause? tableAlias                             #changelogTableName
     | identifierReference temporalClause?
       optionsClause? sample? watermarkClause? tableAlias    #tableName
     | LEFT_PAREN query RIGHT_PAREN sample? watermarkClause?
@@ -1276,7 +1338,7 @@ datetimeUnit
     ;
 
 primaryExpression
-    : name=(CURRENT_DATE | CURRENT_TIMESTAMP | CURRENT_USER | USER | SESSION_USER | CURRENT_TIME)             #currentLike
+    : name=(CURRENT_DATE | CURRENT_TIMESTAMP | CURRENT_USER | USER | SESSION_USER | CURRENT_TIME | CURRENT_PATH)             #currentLike
     | name=(TIMESTAMPADD | DATEADD | DATE_ADD) LEFT_PAREN (unit=datetimeUnit | invalidUnit=stringLit) COMMA unitsAmount=valueExpression COMMA timestamp=valueExpression RIGHT_PAREN             #timestampadd
     | name=(TIMESTAMPDIFF | DATEDIFF | DATE_DIFF | TIMEDIFF) LEFT_PAREN (unit=datetimeUnit | invalidUnit=stringLit) COMMA startTimestamp=valueExpression COMMA endTimestamp=valueExpression RIGHT_PAREN    #timestampdiff
     | CASE whenClause+ (ELSE elseExpression=expression)? END                                   #searchedCase
@@ -1436,8 +1498,11 @@ nonTrivialPrimitiveType
     | INTERVAL
         (fromYearMonth=(YEAR | MONTH) (TO to=MONTH)? |
          fromDayTime=(DAY | HOUR | MINUTE | SECOND) (TO to=(HOUR | MINUTE | SECOND))?)?
-    | TIMESTAMP (WITHOUT TIME ZONE)?
-    | TIME (LEFT_PAREN precision=integerValue RIGHT_PAREN)? (WITHOUT TIME ZONE)?
+    | TIMESTAMP (LEFT_PAREN precision=integerValue RIGHT_PAREN)?
+        (withLocalTimeZone | withoutTimeZone)?
+    | TIMESTAMP_LTZ (LEFT_PAREN precision=integerValue RIGHT_PAREN)?
+    | TIMESTAMP_NTZ (LEFT_PAREN precision=integerValue RIGHT_PAREN)?
+    | TIME (LEFT_PAREN precision=integerValue RIGHT_PAREN)? (withoutTimeZone)?
     | GEOGRAPHY LEFT_PAREN (srid=integerValue | any=ANY) RIGHT_PAREN
     | GEOMETRY LEFT_PAREN (srid=integerValue | any=ANY) RIGHT_PAREN
     ;
@@ -1451,10 +1516,17 @@ trivialPrimitiveType
     | FLOAT | REAL
     | DOUBLE
     | DATE
-    | TIMESTAMP_LTZ | TIMESTAMP_NTZ
     | BINARY
     | VOID
     | VARIANT
+    ;
+
+withLocalTimeZone
+    : WITH LOCAL TIME ZONE
+    ;
+
+withoutTimeZone
+    : WITHOUT TIME ZONE
     ;
 
 primitiveType
@@ -1466,7 +1538,7 @@ primitiveType
 dataType
     : complex=ARRAY (LT dataType GT)?                           #complexDataType
     | complex=MAP (LT dataType COMMA dataType GT)?              #complexDataType
-    | complex=STRUCT ((LT complexColTypeList? GT) | NEQ)?       #complexDataType
+    | complex=STRUCT ((LT complexColTypeList? GT) | NEQ {((SqlBaseLexer) getTokenStream().getTokenSource()).decComplexTypeLevelCounter();})?       #complexDataType
     | primitiveType                                             #primitiveDataType
     ;
 
@@ -1849,6 +1921,7 @@ operatorPipeRightSide
     // messages in the event that both are present (this is not allowed).
     | pivotClause unpivotClause?
     | unpivotClause pivotClause?
+    | binByClause
     | sample
     | joinRelation
     | operator=(UNION | EXCEPT | SETMINUS | INTERSECT) setQuantifier? right=queryPrimary
@@ -1880,11 +1953,13 @@ ansiNonReserved
     : ADD
     | AFTER
     | AGGREGATE
+    | ALIGN
     | ALTER
     | ALWAYS
     | ANALYZE
     | ANTI
     | ANY_VALUE
+    | APPROX
     | ARCHIVE
     | ARRAY
     | ASC
@@ -1892,8 +1967,13 @@ ansiNonReserved
     | AT
     | ATOMIC
     | BEGIN
+    | BERNOULLI
     | BETWEEN
     | BIGINT
+    | BIN
+    | BIN_DISTRIBUTE_RATIO
+    | BIN_END
+    | BIN_START
     | BINARY
     | BINARY_HEX
     | BINDING
@@ -1908,6 +1988,7 @@ ansiNonReserved
     | CATALOG
     | CATALOGS
     | CHANGE
+    | CHANGES
     | CHAR
     | CHARACTER
     | CLEAR
@@ -1931,6 +2012,7 @@ ansiNonReserved
     | CURSOR
     | CUBE
     | CURRENT
+    | CURRENT_DATABASE
     | DATA
     | DATABASE
     | DATABASES
@@ -1947,6 +2029,7 @@ ansiNonReserved
     | DECIMAL
     | DECLARE
     | DEFAULT
+    | DEFAULT_PATH
     | DEFINED
     | DEFINER
     | DELAY
@@ -1958,6 +2041,7 @@ ansiNonReserved
     | DFS
     | DIRECTORIES
     | DIRECTORY
+    | DISTANCE
     | DISTRIBUTE
     | DIV
     | DO
@@ -1967,8 +2051,10 @@ ansiNonReserved
     | ENFORCED
     | ESCAPED
     | EVOLUTION
+    | EXACT
     | EXCHANGE
     | EXCLUDE
+    | EXCLUSIVE
     | EXISTS
     | EXIT
     | EXPLAIN
@@ -2004,6 +2090,7 @@ ansiNonReserved
     | IMMEDIATE
     | IMPORT
     | INCLUDE
+    | INCLUSIVE
     | INCREMENT
     | INDEX
     | INDEXES
@@ -2062,6 +2149,7 @@ ansiNonReserved
     | NAMESPACES
     | NANOSECOND
     | NANOSECONDS
+    | NEAREST
     | NEXT
     | NO
     | NONE
@@ -2080,6 +2168,7 @@ ansiNonReserved
     | PARTITION
     | PARTITIONED
     | PARTITIONS
+    | PATH
     | PERCENTLIT
     | PIVOT
     | PLACING
@@ -2090,6 +2179,7 @@ ansiNonReserved
     | PROCEDURES
     | PROPERTIES
     | PURGE
+    | QUALIFY
     | QUARTER
     | QUERY
     | RANGE
@@ -2135,6 +2225,7 @@ ansiNonReserved
     | SETS
     | SHORT
     | SHOW
+    | SIMILARITY
     | SINGLE
     | SKEWED
     | SMALLINT
@@ -2155,6 +2246,8 @@ ansiNonReserved
     | SUBSTR
     | SUBSTRING
     | SYNC
+    | SYSTEM
+    | SYSTEM_PATH
     | SYSTEM_TIME
     | SYSTEM_VERSION
     | TABLES
@@ -2182,6 +2275,7 @@ ansiNonReserved
     | UNARCHIVE
     | UNBOUNDED
     | UNCACHE
+    | UNIFORM
     | UNLOCK
     | UNPIVOT
     | UNSET
@@ -2202,6 +2296,7 @@ ansiNonReserved
     | WEEKS
     | WHILE
     | WATERMARK
+    | WIDTH
     | WINDOW
     | WITHOUT
     | YEAR
@@ -2243,6 +2338,7 @@ nonReserved
     : ADD
     | AFTER
     | AGGREGATE
+    | ALIGN
     | ALL
     | ALTER
     | ALWAYS
@@ -2250,6 +2346,7 @@ nonReserved
     | AND
     | ANY
     | ANY_VALUE
+    | APPROX
     | ARCHIVE
     | ARRAY
     | AS
@@ -2259,8 +2356,13 @@ nonReserved
     | ATOMIC
     | AUTHORIZATION
     | BEGIN
+    | BERNOULLI
     | BETWEEN
     | BIGINT
+    | BIN
+    | BIN_DISTRIBUTE_RATIO
+    | BIN_END
+    | BIN_START
     | BINARY
     | BINARY_HEX
     | BINDING
@@ -2279,6 +2381,7 @@ nonReserved
     | CATALOG
     | CATALOGS
     | CHANGE
+    | CHANGES
     | CHAR
     | CHARACTER
     | CHECK
@@ -2289,6 +2392,7 @@ nonReserved
     | CODEGEN
     | COLLATE
     | COLLATION
+    | COLLATIONS
     | COLLECTION
     | COLUMN
     | COLUMNS
@@ -2308,7 +2412,10 @@ nonReserved
     | CUBE
     | CURRENT
     | CURSOR
+    | CURRENT_DATABASE
     | CURRENT_DATE
+    | CURRENT_PATH
+    | CURRENT_SCHEMA
     | CURRENT_TIME
     | CURRENT_TIMESTAMP
     | CURRENT_USER
@@ -2328,6 +2435,7 @@ nonReserved
     | DECIMAL
     | DECLARE
     | DEFAULT
+    | DEFAULT_PATH
     | DEFINED
     | DEFINER
     | DELAY
@@ -2339,6 +2447,7 @@ nonReserved
     | DFS
     | DIRECTORIES
     | DIRECTORY
+    | DISTANCE
     | DISTINCT
     | DISTRIBUTE
     | DIV
@@ -2352,8 +2461,10 @@ nonReserved
     | ESCAPE
     | ESCAPED
     | EVOLUTION
+    | EXACT
     | EXCHANGE
     | EXCLUDE
+    | EXCLUSIVE
     | EXECUTE
     | EXISTS
     | EXIT
@@ -2400,6 +2511,7 @@ nonReserved
     | IMPORT
     | IN
     | INCLUDE
+    | INCLUSIVE
     | INCREMENT
     | INDEX
     | INDEXES
@@ -2462,6 +2574,7 @@ nonReserved
     | NAMESPACES
     | NANOSECOND
     | NANOSECONDS
+    | NEAREST
     | NEXT
     | NO
     | NONE
@@ -2488,6 +2601,7 @@ nonReserved
     | PARTITION
     | PARTITIONED
     | PARTITIONS
+    | PATH
     | PERCENTLIT
     | PIVOT
     | PLACING
@@ -2499,6 +2613,7 @@ nonReserved
     | PROCEDURES
     | PROPERTIES
     | PURGE
+    | QUALIFY
     | QUARTER
     | QUERY
     | RANGE
@@ -2546,6 +2661,7 @@ nonReserved
     | SETS
     | SHORT
     | SHOW
+    | SIMILARITY
     | SINGLE
     | SKEWED
     | SMALLINT
@@ -2568,6 +2684,8 @@ nonReserved
     | SUBSTR
     | SUBSTRING
     | SYNC
+    | SYSTEM
+    | SYSTEM_PATH
     | SYSTEM_TIME
     | SYSTEM_VERSION
     | TABLE
@@ -2600,6 +2718,7 @@ nonReserved
     | UNARCHIVE
     | UNBOUNDED
     | UNCACHE
+    | UNIFORM
     | UNIQUE
     | UNKNOWN
     | UNLOCK
@@ -2625,6 +2744,7 @@ nonReserved
     | WHILE
     | WHEN
     | WHERE
+    | WIDTH
     | WINDOW
     | WITH
     | WITHIN

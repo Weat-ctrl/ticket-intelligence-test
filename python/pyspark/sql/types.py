@@ -1469,9 +1469,9 @@ class StructType(DataType):
         else:
             self.fields = fields
             self.names = [f.name for f in fields]
-            assert all(
-                isinstance(f, StructField) for f in fields
-            ), "fields should be a list of StructField"
+            assert all(isinstance(f, StructField) for f in fields), (
+                "fields should be a list of StructField"
+            )
         # Precalculated list of fields that need conversion with fromInternal/toInternal functions
         self._needConversion = [f.needConversion() for f in self]
         self._needSerializeAnyField = any(self._needConversion)
@@ -1483,12 +1483,10 @@ class StructType(DataType):
         data_type: Union[str, DataType],
         nullable: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> "StructType":
-        ...
+    ) -> "StructType": ...
 
     @overload
-    def add(self, field: StructField) -> "StructType":
-        ...
+    def add(self, field: StructField) -> "StructType": ...
 
     def add(
         self,
@@ -1589,8 +1587,12 @@ class StructType(DataType):
             return StructType(self.fields[key])
         else:
             raise PySparkTypeError(
-                errorClass="NOT_INT_OR_SLICE_OR_STR",
-                messageParameters={"arg_name": "key", "arg_type": type(key).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "int, slice or str",
+                    "arg_name": "key",
+                    "arg_type": type(key).__name__,
+                },
             )
 
     def simpleString(self) -> str:
@@ -1988,10 +1990,17 @@ class UserDefinedType(DataType):
         pyClass = pyUDT[split + 1 :]
         m = __import__(pyModule, globals(), locals(), [pyClass])
         if not hasattr(m, pyClass):
-            s = base64.b64decode(json["serializedClass"].encode("utf-8"))
-            UDT = CloudPickleSerializer().loads(s)
+            raise PySparkValueError(
+                errorClass="UNSUPPORTED_OPERATION",
+                messageParameters={"operation": "unpickling user defined types"},
+            )
         else:
             UDT = getattr(m, pyClass)
+            if not (isinstance(UDT, type) and issubclass(UDT, UserDefinedType)):
+                raise PySparkTypeError(
+                    errorClass="FIELD_TYPE_MISMATCH",
+                    messageParameters={"obj": str(UDT), "data_type": "UserDefinedType"},
+                )
         return UDT()
 
 
@@ -2061,10 +2070,14 @@ class VariantVal:
     @classmethod
     def parseJson(cls, json_str: str) -> "VariantVal":
         """
-        Convert the VariantVal to a nested Python object of Python data types.
-        :return: Python representation of the Variant nested structure
+        Parse a JSON string and construct a VariantVal.
+
+        Returns
+        -------
+        VariantVal
+            A VariantVal representing the parsed Variant value.
         """
-        (value, metadata) = VariantUtils.parse_json(json_str)
+        value, metadata = VariantUtils.parse_json(json_str)
         return VariantVal(value, metadata)
 
 
@@ -2589,14 +2602,14 @@ _array_type_mappings: Dict[str, Type[DataType]] = {
 }
 
 # compute array typecode mappings for signed integer types
-for _typecode in _array_signed_int_typecode_ctype_mappings.keys():
+for _typecode in _array_signed_int_typecode_ctype_mappings:
     size = ctypes.sizeof(_array_signed_int_typecode_ctype_mappings[_typecode]) * 8
     dt = _int_size_to_type(size)
     if dt is not None:
         _array_type_mappings[_typecode] = dt
 
 # compute array typecode mappings for unsigned integer types
-for _typecode in _array_unsigned_int_typecode_ctype_mappings.keys():
+for _typecode in _array_unsigned_int_typecode_ctype_mappings:
     # JVM does not have unsigned types, so use signed types that is at least 1
     # bit larger to store
     size = ctypes.sizeof(_array_unsigned_int_typecode_ctype_mappings[_typecode]) * 8 + 1
@@ -2874,23 +2887,19 @@ def _has_type(dt: DataType, dts: Union[type, Tuple[type, ...]]) -> bool:
 
 
 @overload
-def _merge_type(a: StructType, b: StructType, name: Optional[str] = None) -> StructType:
-    ...
+def _merge_type(a: StructType, b: StructType, name: Optional[str] = None) -> StructType: ...
 
 
 @overload
-def _merge_type(a: ArrayType, b: ArrayType, name: Optional[str] = None) -> ArrayType:
-    ...
+def _merge_type(a: ArrayType, b: ArrayType, name: Optional[str] = None) -> ArrayType: ...
 
 
 @overload
-def _merge_type(a: MapType, b: MapType, name: Optional[str] = None) -> MapType:
-    ...
+def _merge_type(a: MapType, b: MapType, name: Optional[str] = None) -> MapType: ...
 
 
 @overload
-def _merge_type(a: DataType, b: DataType, name: Optional[str] = None) -> DataType:
-    ...
+def _merge_type(a: DataType, b: DataType, name: Optional[str] = None) -> DataType: ...
 
 
 def _merge_type(
@@ -2998,10 +3007,8 @@ def _create_converter(dataType: DataType) -> Callable:
     elif isinstance(dataType, MapType):
         kconv = _create_converter(dataType.keyType)
         vconv = _create_converter(dataType.valueType)
-        return (
-            lambda row: dict((kconv(k), vconv(v)) for k, v in row.items())
-            if row is not None
-            else None
+        return lambda row: (
+            dict((kconv(k), vconv(v)) for k, v in row.items()) if row is not None else None
         )
 
     elif isinstance(dataType, NullType):
@@ -3479,7 +3486,6 @@ def _create_row(
 
 
 class Row(tuple):
-
     """
     A row in :class:`DataFrame`.
     The fields in it can be accessed:
@@ -3536,12 +3542,10 @@ class Row(tuple):
     """
 
     @overload
-    def __new__(cls, *args: str) -> "Row":
-        ...
+    def __new__(cls, *args: str) -> "Row": ...
 
     @overload
-    def __new__(cls, **kwargs: Any) -> "Row":
-        ...
+    def __new__(cls, **kwargs: Any) -> "Row": ...
 
     def __new__(cls, *args: Optional[str], **kwargs: Optional[Any]) -> "Row":
         if args and kwargs:
@@ -3854,7 +3858,7 @@ def _test() -> None:
 
     globs = globals()
     globs["spark"] = SparkSession.builder.getOrCreate()
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         globs=globs, optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
     )
     if failure_count:

@@ -36,7 +36,7 @@ import org.apache.spark.deploy.{RedirectConsolePlugin, SparkHadoopUtil}
 import org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
 import org.apache.spark.sql.hive.HiveUtils._
 import org.apache.spark.sql.hive.client.HiveClientImpl
-import org.apache.spark.sql.hive.test.HiveTestJars
+import org.apache.spark.sql.hive.test.{HiveTestJars, TestSpark21101Jar, TestUDTFJar}
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.util.{ThreadUtils, Utils}
 
@@ -396,20 +396,18 @@ class CliSuite extends SparkFunSuite {
   }
 
   test("list jars") {
-    val jarFile = Thread.currentThread().getContextClassLoader.getResource("TestUDTF.jar")
-    assume(jarFile != null)
+    val jarFile = TestUDTFJar.jar.toURI.toURL
     runCliWithin(2.minute)(
       s"ADD JAR $jarFile;" -> "",
-      s"LIST JARS;" -> "TestUDTF.jar"
+      s"LIST JARS;" -> TestUDTFJar.jar.getName
     )
   }
 
   test("list jar <jarfile>") {
-    val jarFile = Thread.currentThread().getContextClassLoader.getResource("TestUDTF.jar")
-    assume(jarFile != null)
+    val jarFile = TestUDTFJar.jar.toURI.toURL
     runCliWithin(2.minute)(
       s"ADD JAR $jarFile;" -> "",
-      s"List JAR $jarFile;" -> "TestUDTF.jar"
+      s"List JAR $jarFile;" -> TestUDTFJar.jar.getName
     )
   }
 
@@ -452,8 +450,7 @@ class CliSuite extends SparkFunSuite {
   }
 
   test("SPARK-28840 test --jars command") {
-    val jarFile = new File("../../sql/hive/src/test/resources/SPARK-21101-1.0.jar")
-    assume(jarFile.exists)
+    val jarFile = TestSpark21101Jar.jar
     runCliWithin(
       1.minute,
       Seq("--jars", s"${jarFile.getCanonicalPath}"))(
@@ -464,8 +461,7 @@ class CliSuite extends SparkFunSuite {
   }
 
   test("SPARK-28840 test --jars and hive.aux.jars.path command") {
-    val jarFile = new File("../../sql/hive/src/test/resources/SPARK-21101-1.0.jar")
-    assume(jarFile.exists)
+    val jarFile = TestSpark21101Jar.jar
     val hiveContribJar = HiveTestJars.getHiveContribJar().getCanonicalPath
     runCliWithin(
       2.minutes,
@@ -678,7 +674,18 @@ class CliSuite extends SparkFunSuite {
       "SELECT /* comment */  1;" -> Seq("SELECT /* comment */  1"),
       "-- comment " -> Seq(),
       "-- comment \nSELECT 1" -> Seq("-- comment \nSELECT 1"),
-      "/*  comment */  " -> Seq()
+      "/*  comment */  " -> Seq(),
+      // SPARK-54876: statement after semicolon ending with block comment should not be dropped
+      "SELECT 1; SELECT 2 /* comment */" -> Seq("SELECT 1", " SELECT 2 /* comment */"),
+      // SPARK-54876: line comment followed by block comment should produce empty result
+      "-- foo\n/* bar */" -> Seq(),
+      "SELECT 1; -- foo\n /* bar */" -> Seq("SELECT 1"),
+      // SPARK-54876: nested block comments
+      "SELECT 1; /* outer /* inner */ */" -> Seq("SELECT 1"),
+      // SPARK-54876: preceding closed block comment + line comment (no SQL statement)
+      "/* a */ -- foo\n/* b */" -> Seq(),
+      // SPARK-54876: semicolons inside backtick-quoted identifiers are not split points
+      "SELECT * FROM `t;a`; SELECT 1" -> Seq("SELECT * FROM `t;a`", " SELECT 1")
     ).foreach { case (query, ret) =>
       assert(cli.splitSemiColon(query).asScala === ret)
     }

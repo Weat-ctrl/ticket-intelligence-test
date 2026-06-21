@@ -27,6 +27,7 @@ import org.apache.arrow.vector.types.{DateUnit, FloatingPointPrecision, Interval
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, FieldType, Schema}
 
 import org.apache.spark.SparkException
+import org.apache.spark.sql.catalyst.types.ops.TypeApiOps
 import org.apache.spark.sql.errors.ExecutionErrors
 import org.apache.spark.sql.types._
 import org.apache.spark.util.ArrayImplicits._
@@ -39,6 +40,14 @@ private[sql] object ArrowUtils {
 
   /** Maps data type from Spark to Arrow. NOTE: timeZoneId required for TimestampTypes */
   def toArrowType(dt: DataType, timeZoneId: String, largeVarTypes: Boolean = false): ArrowType =
+    TypeApiOps(dt)
+      .flatMap(_.toArrowType(timeZoneId))
+      .getOrElse(toArrowTypeDefault(dt, timeZoneId, largeVarTypes))
+
+  private def toArrowTypeDefault(
+      dt: DataType,
+      timeZoneId: String,
+      largeVarTypes: Boolean): ArrowType =
     dt match {
       case BooleanType => ArrowType.Bool.INSTANCE
       case ByteType => new ArrowType.Int(8, true)
@@ -58,7 +67,6 @@ private[sql] object ArrowUtils {
       case TimestampType => new ArrowType.Timestamp(TimeUnit.MICROSECOND, timeZoneId)
       case TimestampNTZType =>
         new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)
-      case _: TimeType => new ArrowType.Time(TimeUnit.NANOSECOND, 8 * 8)
       case NullType => ArrowType.Null.INSTANCE
       case _: YearMonthIntervalType => new ArrowType.Interval(IntervalUnit.YEAR_MONTH)
       case _: DayTimeIntervalType => new ArrowType.Duration(TimeUnit.MICROSECOND)
@@ -67,7 +75,10 @@ private[sql] object ArrowUtils {
         throw ExecutionErrors.unsupportedDataTypeError(dt)
     }
 
-  def fromArrowType(dt: ArrowType): DataType = dt match {
+  def fromArrowType(dt: ArrowType): DataType =
+    TypeApiOps.fromArrowType(dt).getOrElse(fromArrowTypeDefault(dt))
+
+  private def fromArrowTypeDefault(dt: ArrowType): DataType = dt match {
     case ArrowType.Bool.INSTANCE => BooleanType
     case int: ArrowType.Int if int.getIsSigned && int.getBitWidth == 8 => ByteType
     case int: ArrowType.Int if int.getIsSigned && int.getBitWidth == 8 * 2 => ShortType
@@ -89,8 +100,6 @@ private[sql] object ArrowUtils {
         if ts.getUnit == TimeUnit.MICROSECOND && ts.getTimezone == null =>
       TimestampNTZType
     case ts: ArrowType.Timestamp if ts.getUnit == TimeUnit.MICROSECOND => TimestampType
-    case t: ArrowType.Time if t.getUnit == TimeUnit.NANOSECOND && t.getBitWidth == 8 * 8 =>
-      TimeType(TimeType.MICROS_PRECISION)
     case ArrowType.Null.INSTANCE => NullType
     case yi: ArrowType.Interval if yi.getUnit == IntervalUnit.YEAR_MONTH =>
       YearMonthIntervalType()

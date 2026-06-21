@@ -21,7 +21,6 @@ import pandas as pd
 from pyspark.sql import functions as sf
 from pyspark import pandas as ps
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
-from pyspark.testing.sqlutils import SQLTestUtils
 
 
 # This file contains test cases for 'Computations / Descriptive Stats'
@@ -419,6 +418,25 @@ class FrameComputeMixin:
             psdf.nunique(axis=1, dropna=False).tolist(), pdf.nunique(axis=1, dropna=False).tolist()
         )
 
+    def test_nunique_with_string_column_and_missing_values(self):
+        pdf = pd.DataFrame({"A": ["x", None, "x"], "B": ["y", "z", None]})
+        psdf = ps.from_pandas(pdf)
+
+        expected = pdf.nunique()
+        expected_dropna_false = pdf.nunique(dropna=False)
+        actual = psdf.nunique()
+        actual_dropna_false = psdf.nunique(dropna=False)
+
+        self.assert_eq(actual, expected)
+        self.assert_eq(actual_dropna_false, expected_dropna_false)
+
+        self.assertEqual(actual.index.dtype, expected.index.dtype)
+        self.assertEqual(actual_dropna_false.index.dtype, expected_dropna_false.index.dtype)
+        self.assertEqual(actual.to_pandas().index.dtype, expected.index.dtype)
+        self.assertEqual(
+            actual_dropna_false.to_pandas().index.dtype, expected_dropna_false.index.dtype
+        )
+
     def test_quantile(self):
         pdf, psdf = self.df_pair
 
@@ -551,7 +569,6 @@ class FrameComputeMixin:
 class FrameComputeTests(
     FrameComputeMixin,
     PandasOnSparkTestCase,
-    SQLTestUtils,
 ):
     pass
 

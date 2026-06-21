@@ -18,6 +18,7 @@
 """
 Wrappers around spark that correspond to common pandas functions.
 """
+
 from typing import (
     Any,
     Callable,
@@ -140,6 +141,7 @@ __all__ = [
     "broadcast",
     "read_orc",
     "json_normalize",
+    "show_versions",
 ]
 
 
@@ -436,7 +438,7 @@ def read_csv(
                 )
             if len(missing) > 0:
                 raise ValueError(
-                    "Usecols do not match columns, columns expected but not " "found: %s" % missing
+                    "Usecols do not match columns, columns expected but not found: %s" % missing
                 )
 
             if len(column_labels) > 0:
@@ -1783,7 +1785,7 @@ def to_datetime(
     if isinstance(arg, Series):
         return arg.pandas_on_spark.transform_batch(pandas_to_datetime)
     if isinstance(arg, DataFrame):
-        unit = {k: _unit_map[k.lower()] for k in arg.keys() if k.lower() in _unit_map}
+        unit = {k: _unit_map[k.lower()] for k in arg if k.lower() in _unit_map}
         unit_rev = {v: k for k, v in unit.items()}
         list_cols = [unit_rev["year"], unit_rev["month"], unit_rev["day"]]
         for u in ["h", "m", "s", "ms", "us"]:
@@ -2280,11 +2282,13 @@ def get_dummies(
                     raise KeyError(name_like_string(columns))
                 if prefix is None:
                     prefix = [
-                        str(label[len(columns) :])
-                        if len(label) > len(columns) + 1
-                        else label[len(columns)]
-                        if len(label) == len(columns) + 1
-                        else ""
+                        (
+                            str(label[len(columns) :])
+                            if len(label) > len(columns) + 1
+                            else label[len(columns)]
+                            if len(label) == len(columns) + 1
+                            else ""
+                        )
                         for label in column_labels
                     ]
             elif any(isinstance(col, tuple) for col in columns) and any(
@@ -2567,9 +2571,11 @@ def concat(
 
         level: int = min(psdf._internal.column_labels_level for psdf in psdfs)
         psdfs = [
-            DataFrame._index_normalized_frame(level, psdf)
-            if psdf._internal.column_labels_level > level
-            else psdf
+            (
+                DataFrame._index_normalized_frame(level, psdf)
+                if psdf._internal.column_labels_level > level
+                else psdf
+            )
             for psdf in psdfs
         ]
 
@@ -2651,6 +2657,10 @@ def concat(
             num_series += 1
             series_names.add(obj.name)
             if not ignore_index and not should_return_series:
+                new_objs.append(obj.to_frame())
+            elif LooseVersion(pd.__version__) >= "3.0.0" and not should_return_series:
+                # pandas 3 preserves a named Series as its own column during
+                # row-wise concat with ignore_index=True instead of renaming it to 0.
                 new_objs.append(obj.to_frame())
             else:
                 new_objs.append(obj.to_frame(DEFAULT_SERIES_NAME))
@@ -3870,6 +3880,134 @@ def json_normalize(
     return ps.DataFrame(internal)
 
 
+def _get_sys_info() -> Dict[str, Any]:
+    """Returns system information as a dictionary."""
+    import locale
+    import os
+    import platform
+    import struct
+    import sys as _sys
+
+    uname_result = platform.uname()
+    try:
+        language_code, encoding = locale.getlocale()
+    except (TypeError, ValueError):
+        language_code, encoding = (None, None)
+    return {
+        "python": platform.python_version(),
+        "python-bits": struct.calcsize("P") * 8,
+        "OS": uname_result.system,
+        "OS-release": uname_result.release,
+        "Version": uname_result.version,
+        "machine": uname_result.machine,
+        "processor": uname_result.processor,
+        "byteorder": _sys.byteorder,
+        "LC_ALL": os.environ.get("LC_ALL"),
+        "LANG": os.environ.get("LANG"),
+        "LOCALE": {"language-code": language_code, "encoding": encoding},
+    }
+
+
+def _get_dependency_info() -> Dict[str, Optional[str]]:
+    """Returns dependency information as a dictionary."""
+    import importlib
+
+    import pyspark
+
+    deps = [
+        "pyspark",
+        "pandas",
+        "numpy",
+        "pyarrow",
+        "grpc",
+        "google.protobuf",
+        "matplotlib",
+        "IPython",
+        "sphinx",
+        "plotly",
+        "tabulate",
+        "scipy",
+        "mlflow",
+    ]
+    result: Dict[str, Optional[str]] = {}
+    for modname in deps:
+        if modname == "pyspark":
+            result[modname] = pyspark.__version__
+            continue
+        try:
+            mod = importlib.import_module(modname)
+        except ImportError:
+            result[modname] = None
+        except Exception:
+            # Dependency conflicts may cause non-ImportError failures.
+            result[modname] = "N/A"
+        else:
+            result[modname] = getattr(mod, "__version__", None)
+    return result
+
+
+def show_versions(as_json: Union[str, bool] = False) -> None:
+    """
+    Provide useful information, important for bug reports.
+
+    It comprises info about hosting operation system, pyspark.pandas version,
+    and versions of other installed relative packages.
+
+    .. versionadded:: 4.3.0
+
+    Parameters
+    ----------
+    as_json : str or bool, default False
+        * If False, outputs info in a human readable form to the console.
+        * If str, it will be considered as a path to a file.
+          Info will be written to that file in JSON format.
+        * If True, outputs info in JSON format to the console.
+
+    Examples
+    --------
+    >>> ps.show_versions()  # doctest: +SKIP
+    INSTALLED VERSIONS
+    ------------------
+    python           : 3.10.6.final.0
+    python-bits      : 64
+    ...
+    pyspark          : 4.3.0.dev0
+    pandas           : 2.2.0
+    numpy            : 1.24.3
+    pyarrow          : 15.0.0
+    ...
+    """
+    sys_info = _get_sys_info()
+    deps = _get_dependency_info()
+
+    if as_json:
+        import sys as _sys
+
+        j = {"system": sys_info, "dependencies": deps}
+
+        if as_json is True:
+            _sys.stdout.writelines(json.dumps(j, indent=2))
+        else:
+            assert isinstance(as_json, str)
+            with open(as_json, "w", encoding="utf-8") as f:
+                json.dump(j, f, indent=2)
+        return
+
+    locale_info = sys_info["LOCALE"]
+    sys_info["LOCALE"] = "{language_code}.{encoding}".format(
+        language_code=locale_info["language-code"], encoding=locale_info["encoding"]
+    )
+
+    maxlen = max(len(x) for x in deps)
+    print("\nINSTALLED VERSIONS")
+    print("------------------")
+    for k, v in sys_info.items():
+        print(f"{k:<{maxlen}}: {v}")
+    print("")
+    for k, v in deps.items():
+        print(f"{k:<{maxlen}}: {v}")
+
+
 def _get_index_map(
     sdf: PySparkDataFrame, index_col: Optional[Union[str, List[str]]] = None
 ) -> Tuple[Optional[List[PySparkColumn]], Optional[List[Label]]]:
@@ -3941,7 +4079,7 @@ def _test() -> None:
     path = tempfile.mkdtemp()
     globs["path"] = path
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.namespace,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

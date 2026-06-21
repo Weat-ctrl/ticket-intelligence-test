@@ -19,9 +19,12 @@ package org.apache.spark.sql.catalyst.analysis
 
 import java.util.concurrent.atomic.AtomicBoolean
 
+import scala.util.control.NonFatal
+
+import org.apache.spark.SparkThrowable
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.FunctionIdentifier
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, SQLConfHelper}
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
@@ -29,8 +32,11 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.connector.catalog.{
   CatalogManager,
   CatalogNotFoundException,
+  CatalogPlugin,
   CatalogV2Util,
-  LookupCatalog
+  Identifier,
+  LookupCatalog,
+  ProcedureCatalog
 }
 
 /**
@@ -54,65 +60,93 @@ import org.apache.spark.sql.connector.catalog.functions.{
   UnboundFunction
 }
 import org.apache.spark.sql.errors.{DataTypeErrorsBase, QueryCompilationErrors}
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.connector.V1Function
 import org.apache.spark.sql.types._
 
 class FunctionResolution(
     override val catalogManager: CatalogManager,
     relationResolution: RelationResolution)
-    extends DataTypeErrorsBase with LookupCatalog with Logging {
+    extends DataTypeErrorsBase with LookupCatalog with SQLConfHelper with Logging {
   private val v1SessionCatalog = catalogManager.v1SessionCatalog
 
   private val trimWarningEnabled = new AtomicBoolean(true)
 
-  /** Returns the current catalog path, preferring the view's context if resolving a view. */
-  private def currentCatalogPath: Seq[String] = {
-    val ctx = AnalysisContext.get.catalogAndNamespace
-    if (ctx.nonEmpty) ctx
-    else (Seq(catalogManager.currentCatalog.name) ++ catalogManager.currentNamespace).toSeq
+  /** True if nameParts is 3-part and the first part is the system catalog name. */
+  private def isSystemCatalogQualified(nameParts: Seq[String]): Boolean =
+    nameParts.length == 3 &&
+      nameParts.head.equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME)
+
+  /**
+   * True iff `system.session` is searched before `system.builtin` in the effective SQL PATH.
+   *
+   * Drives the `count(*) -> count(1)` rewrite (which must skip transformation when a temp
+   * `count` shadows the builtin) and the `SessionCatalog` security check that blocks creating
+   * a temp function with a builtin's name. Reads the live PATH via `CatalogManager` and
+   * applies the same kinds extraction that drives `SessionCatalog`'s fast-path provider, so
+   * the predicate stays in sync with the lookup loop's actual order. Uses the consolidated
+   * snapshot helper (SPARK-56939) so the (catalog, namespace, path) triple is observed
+   * atomically.
+   */
+  def isSessionBeforeBuiltinInPath: Boolean = {
+    catalogManager.sessionFunctionKindsForUnqualifiedResolution().headOption
+      .contains(org.apache.spark.sql.catalyst.catalog.SessionCatalog.Temp)
   }
 
   /**
-   * Produces the ordered list of fully qualified candidate names for resolution.
+   * Produces the ordered list of candidate names for resolution. Expansion happens in two cases:
    *
-   * @param nameParts The function name parts.
-   * @return A sequence of fully qualified function names to attempt resolution with.
+   * 1. Single-part names: expanded via [[CatalogManager.sqlResolutionPathEntries]] (same list as
+   *    relation resolution), where each path entry is fully qualified so appending the name
+   *    produces fully qualified candidates.
+   * 2. `builtin.name` or `session.name`: prepending `system` creates a fully qualified
+   *    system catalog candidate. The original 2-part name is also kept as a persistent
+   *    catalog candidate (qualified downstream). Order is controlled by
+   *    the `persistentCatalogFirst` config.
+   *
+   * All other multi-part names are returned as-is for downstream resolution.
+   *
+   * When [[AnalysisContext.resolutionPathEntries]] is set (view or SQL function / table function
+   * body with a pinned path, with [[SQLConf.PATH_ENABLED]] true), that frozen list is used
+   * directly, matching [[RelationResolution.relationResolutionEntries]] so routine order stays
+   * aligned with relation order.
    */
+  private[analysis] def sqlResolutionPathEntriesForAnalysis: Seq[Seq[String]] =
+    catalogManager.resolutionPathEntriesForAnalysis(
+      AnalysisContext.get.resolutionPathEntries,
+      AnalysisContext.get.catalogAndNamespace)
+
   private def resolutionCandidates(nameParts: Seq[String]): Seq[Seq[String]] = {
     if (nameParts.size == 1) {
-      val searchPath = SQLConf.get.resolutionSearchPath(currentCatalogPath)
-      searchPath.map(_ ++ nameParts)
-    } else {
-      nameParts.size match {
-        case 2 if FunctionResolution.sessionNamespaceKind(nameParts).isDefined =>
-          // Partially qualified builtin/session: try persistent first so user schema wins
-          Seq(nameParts, Seq(CatalogManager.SYSTEM_CATALOG_NAME) ++ nameParts)
-        case _ =>
-          Seq(nameParts)
+      sqlResolutionPathEntriesForAnalysis.map(_ ++ nameParts)
+    } else if (nameParts.size == 2 &&
+        FunctionResolution.sessionNamespaceKind(nameParts).isDefined) {
+      val systemCandidate = CatalogManager.SYSTEM_CATALOG_NAME +: nameParts
+      if (conf.prioritizeSystemCatalog) {
+        Seq(systemCandidate, nameParts)
+      } else {
+        Seq(nameParts, systemCandidate)
       }
+    } else {
+      Seq(nameParts)
     }
   }
 
-  private def resolveQualifiedFunction(
+  private def resolveFunctionCandidate(
       nameParts: Seq[String],
       unresolvedFunc: UnresolvedFunction): Option[Expression] = {
-    if (nameParts.length == 3 &&
-        nameParts.head.equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME)) {
-      // Try resolving as a session-namespace function (builtin or temp)
-      FunctionResolution.sessionNamespaceKind(nameParts).flatMap { kind =>
-        val funcName = nameParts.last
-        val expr = v1SessionCatalog.resolveScalarFunction(kind, funcName, unresolvedFunc.arguments)
+    if (isSystemCatalogQualified(nameParts)) {
+      v1SessionCatalog.identifierFromSystemNameParts(nameParts).flatMap { ident =>
+        val expr = v1SessionCatalog.resolveScalarFunctionByIdentifier(
+          ident, unresolvedFunc.arguments)
         if (expr.isEmpty) {
-          if (v1SessionCatalog.lookupFunctionInfo(
-              kind, funcName, tableFunction = true).isDefined) {
-            throw QueryCompilationErrors.notAScalarFunctionError(funcName, unresolvedFunc)
+          if (v1SessionCatalog.lookupFunctionInfoByIdentifier(
+              ident, tableFunction = true).isDefined) {
+            throw QueryCompilationErrors.notAScalarFunctionError(ident.funcName, unresolvedFunc)
           }
         }
         expr.map(e => validateFunction(e, unresolvedFunc.arguments.length, unresolvedFunc))
       }
     } else {
-      // Try resolving as a persistent function in a catalog
       try {
         val CatalogAndIdentifier(catalog, ident) =
           relationResolution.expandIdentifier(nameParts)
@@ -125,14 +159,11 @@ class FunctionResolution(
             resolveV2Function(unboundV2Func, unresolvedFunc.arguments, unresolvedFunc)
         })
       } catch {
-        case _: NoSuchFunctionException =>
+        case _: NoSuchFunctionException |
+             _: NoSuchNamespaceException |
+             _: CatalogNotFoundException =>
           None
-        case _: NoSuchNamespaceException =>
-          None
-        case _: CatalogNotFoundException =>
-          None
-        case e: AnalysisException
-            if e.getCondition == "FORBIDDEN_OPERATION" =>
+        case e: AnalysisException if e.getCondition == "FORBIDDEN_OPERATION" =>
           None
         case e: AnalysisException =>
           throw e
@@ -142,44 +173,46 @@ class FunctionResolution(
 
   def resolveFunction(unresolvedFunc: UnresolvedFunction): Expression = {
     withPosition(unresolvedFunc) {
-      // Internal functions are special; they have precedence if the parser flagged them.
+      // Internal functions resolve via the internal registry when the parser marks them as
+      // internal; they are not resolved via the search path.
       if (unresolvedFunc.isInternal && unresolvedFunc.nameParts.size == 1) {
-        val funcIdentifier = FunctionIdentifier(unresolvedFunc.nameParts.head)
         try {
           val func = FunctionRegistry.internal.lookupFunction(
-            funcIdentifier, unresolvedFunc.arguments)
+            FunctionIdentifier(unresolvedFunc.nameParts.head), unresolvedFunc.arguments)
           return validateFunction(func, unresolvedFunc.arguments.length, unresolvedFunc)
         } catch {
           case _: NoSuchFunctionException =>
-            // Ignore and try standard resolution
+            // Ignore and try standard resolution.
+          case e: AnalysisException if e.getCondition == "UNRESOLVED_ROUTINE" =>
+            // The internal registry throws AnalysisException when the function is not found;
+            // fall through to standard resolution.
         }
       }
 
       val candidates = resolutionCandidates(unresolvedFunc.nameParts)
       for (nameParts <- candidates) {
-        resolveQualifiedFunction(nameParts, unresolvedFunc) match {
+        resolveFunctionCandidate(nameParts, unresolvedFunc) match {
           case Some(expr) => return expr
           case None =>
         }
       }
-      val searchPath = SQLConf.get.resolutionSearchPath(currentCatalogPath)
       throw QueryCompilationErrors.unresolvedRoutineError(
-        unresolvedFunc.nameParts, searchPath.map(toSQLId), unresolvedFunc.origin)
+        unresolvedFunc.nameParts,
+        sqlResolutionPathEntriesForAnalysis.map(toSQLId),
+        unresolvedFunc.origin)
     }
   }
 
-  private def resolveQualifiedTableFunction(
+  private def resolveTableFunctionCandidate(
       nameParts: Seq[String],
       arguments: Seq[Expression]): Option[LogicalPlan] = {
-    if (nameParts.length == 3 &&
-        nameParts.head.equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME)) {
-      FunctionResolution.sessionNamespaceKind(nameParts).flatMap { kind =>
-        val funcName = nameParts.last
-        val resolvedPlan = v1SessionCatalog.resolveTableFunction(kind, funcName, arguments)
+    if (isSystemCatalogQualified(nameParts)) {
+      v1SessionCatalog.identifierFromSystemNameParts(nameParts).flatMap { ident =>
+        val resolvedPlan = v1SessionCatalog.resolveTableFunctionByIdentifier(ident, arguments)
         if (resolvedPlan.isDefined) return resolvedPlan
-        if (v1SessionCatalog.lookupFunctionInfo(
-            kind, funcName, tableFunction = false).isDefined) {
-          throw QueryCompilationErrors.notATableFunctionError(funcName)
+        if (v1SessionCatalog.lookupFunctionInfoByIdentifier(
+            ident, tableFunction = false).isDefined) {
+          throw QueryCompilationErrors.notATableFunctionError(ident.funcName)
         }
         None
       }
@@ -195,31 +228,35 @@ class FunctionResolution(
       } catch {
         case _: NoSuchFunctionException | _: NoSuchNamespaceException |
              _: CatalogNotFoundException =>
-          try {
-            if (CatalogV2Util.isSessionCatalog(catalog)) {
-              if (v1SessionCatalog.isPersistentFunction(ident.asFunctionIdentifier)) {
-                throw QueryCompilationErrors.notATableFunctionError(ident.name())
-              }
-            } else {
-              if (catalog.asFunctionCatalog.functionExists(ident)) {
-                throw QueryCompilationErrors.notATableFunctionError(ident.name())
-              }
-            }
-          } catch {
-            case _: NoSuchFunctionException | _: NoSuchNamespaceException |
-                 _: CatalogNotFoundException =>
-              // ignore
-            case e: AnalysisException
-                if e.getCondition == "FORBIDDEN_OPERATION" =>
-              // ignore
-          }
+          tryRethrowNotTableFunction(catalog, ident)
           None
-        case e: AnalysisException
-            if e.getCondition == "FORBIDDEN_OPERATION" =>
+        case e: AnalysisException if e.getCondition == "FORBIDDEN_OPERATION" =>
           None
         case e: AnalysisException =>
           throw e
       }
+    }
+  }
+
+  /**
+   * On table-function lookup failure, throw a clearer error if the name exists
+   * as a non-table function.
+   */
+  private def tryRethrowNotTableFunction(catalog: CatalogPlugin, ident: Identifier): Unit = {
+    try {
+      if (CatalogV2Util.isSessionCatalog(catalog)) {
+        if (v1SessionCatalog.isPersistentFunction(ident.asFunctionIdentifier)) {
+          throw QueryCompilationErrors.notATableFunctionError(ident.name())
+        }
+      } else if (catalog.asFunctionCatalog.functionExists(ident)) {
+        throw QueryCompilationErrors.notATableFunctionError(ident.name())
+      }
+    } catch {
+      case _: NoSuchFunctionException | _: NoSuchNamespaceException |
+           _: CatalogNotFoundException =>
+        ()
+      case e: AnalysisException if e.getCondition == "FORBIDDEN_OPERATION" =>
+        ()
     }
   }
 
@@ -228,12 +265,48 @@ class FunctionResolution(
       arguments: Seq[Expression]): Option[LogicalPlan] = {
     val candidates = resolutionCandidates(nameParts)
     for (nameParts <- candidates) {
-      resolveQualifiedTableFunction(nameParts, arguments) match {
+      resolveTableFunctionCandidate(nameParts, arguments) match {
         case Some(plan) => return Some(plan)
         case None =>
       }
     }
     None
+  }
+
+  private def resolveInternalFunction(
+      name: String, arguments: Seq[Expression]): Expression = {
+    val qualified = FunctionIdentifier(
+      name, Some(CatalogManager.SESSION_NAMESPACE), Some(CatalogManager.SYSTEM_CATALOG_NAME))
+    if (FunctionRegistry.internal.functionExists(qualified)) {
+      FunctionRegistry.internal.lookupFunction(qualified, arguments)
+    } else {
+      FunctionRegistry.internal.lookupFunction(FunctionIdentifier(name), arguments)
+    }
+  }
+
+  def resolveBuiltinOrTempFunction(
+      name: Seq[String],
+      arguments: Seq[Expression],
+      u: UnresolvedFunction): Option[Expression] = {
+    val expression = if (name.length == 1 && u.isInternal) {
+      Option(resolveInternalFunction(name.head, arguments))
+    } else if (name.length == 1) {
+      v1SessionCatalog.resolveBuiltinOrTempFunction(name.head, arguments)
+    } else {
+      None
+    }
+    expression.map { func =>
+      validateFunction(func, arguments.length, u)
+    }
+  }
+
+  def resolveTableValuedFunction(u: UnresolvedTableValuedFunction): LogicalPlan = {
+    resolveTableFunction(u.name, u.functionArgs)
+      .getOrElse {
+        throw new NoSuchFunctionException(
+          db = u.name.dropRight(1).mkString("."),
+          func = u.name.last)
+      }
   }
 
   /**
@@ -247,32 +320,27 @@ class FunctionResolution(
   def lookupBuiltinOrTempFunction(
       nameParts: Seq[String],
       unresolvedFunc: Option[UnresolvedFunction]): Option[ExpressionInfo] = {
-    if (nameParts.size == 1 && unresolvedFunc.exists(_.isInternal)) {
-      FunctionRegistry.internal.lookupFunction(FunctionIdentifier(nameParts.head))
-    } else {
-      FunctionResolution.sessionNamespaceKind(nameParts) match {
-        case Some(kind) =>
-          v1SessionCatalog.lookupFunctionInfo(kind, nameParts.last, tableFunction = false)
-        case None =>
-          if (nameParts.size == 1) {
-            v1SessionCatalog.lookupBuiltinOrTempFunction(nameParts.head)
-          } else {
-            None
-          }
-      }
+    val n = nameParts.length
+    if (n == 1 && unresolvedFunc.exists(_.isInternal)) {
+      return FunctionRegistry.internal.lookupFunction(FunctionIdentifier(nameParts.head))
+    }
+    v1SessionCatalog.identifierFromSystemNameParts(nameParts) match {
+      case Some(ident) =>
+        v1SessionCatalog.lookupFunctionInfoByIdentifier(ident, tableFunction = false)
+      case None =>
+        if (n == 1) v1SessionCatalog.lookupBuiltinOrTempFunction(nameParts.head)
+        else None
     }
   }
 
   def lookupBuiltinOrTempTableFunction(nameParts: Seq[String]): Option[ExpressionInfo] = {
-    FunctionResolution.sessionNamespaceKind(nameParts) match {
-      case Some(kind) =>
-        v1SessionCatalog.lookupFunctionInfo(kind, nameParts.last, tableFunction = true)
+    val n = nameParts.length
+    v1SessionCatalog.identifierFromSystemNameParts(nameParts) match {
+      case Some(ident) =>
+        v1SessionCatalog.lookupFunctionInfoByIdentifier(ident, tableFunction = true)
       case None =>
-        if (nameParts.length == 1) {
-          v1SessionCatalog.lookupBuiltinOrTempTableFunction(nameParts.head)
-        } else {
-          None
-        }
+        if (n == 1) v1SessionCatalog.lookupBuiltinOrTempTableFunction(nameParts.head)
+        else None
     }
   }
 
@@ -300,6 +368,43 @@ class FunctionResolution(
     }
 
     // Check external catalog for persistent functions
+    if (nameParts.length == 1) {
+      // Must match [[resolutionCandidates]] / [[resolveFunction]]: single-part names use PATH +
+      // session order, not only the current namespace (LookupCatalog single-part rule).
+      // `system.session.<name>` and `system.builtin.<name>` candidates were already resolved by
+      // [[lookupBuiltinOrTempFunction]] / [[lookupBuiltinOrTempTableFunction]] above (they
+      // route through `identifierFromSystemNameParts`, which only accepts those two
+      // namespaces); skip them here to avoid redundant catalog calls. Other `system.<x>`
+      // namespaces -- if any are ever added -- still go through persistent lookup.
+      val persistentCandidates = resolutionCandidates(nameParts).filterNot { c =>
+        c.length >= 2 &&
+          c.head.equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME) && {
+            val ns = c(1)
+            ns.equalsIgnoreCase(CatalogManager.SESSION_NAMESPACE) ||
+              ns.equalsIgnoreCase(CatalogManager.BUILTIN_NAMESPACE)
+          }
+      }
+      for (candidate <- persistentCandidates) {
+        try {
+          candidate match {
+            case CatalogAndIdentifier(catalog, ident) =>
+              if (catalog.asFunctionCatalog.functionExists(ident)) {
+                return FunctionType.Persistent
+              }
+            case _ =>
+          }
+        } catch {
+          // Only treat explicit "not found" / "forbidden" signals as a miss. Any other failure
+          // (e.g. permission denied, transient catalog error) propagates.
+          case _: NoSuchFunctionException
+             | _: NoSuchNamespaceException
+             | _: CatalogNotFoundException =>
+          case e: AnalysisException if e.getCondition == "FORBIDDEN_OPERATION" =>
+        }
+      }
+      return FunctionType.NotFound
+    }
+
     val CatalogAndIdentifier(catalog, ident) = relationResolution.expandIdentifier(nameParts)
     if (catalog.asFunctionCatalog.functionExists(ident)) {
       return FunctionType.Persistent
@@ -547,6 +652,66 @@ class FunctionResolution(
       errorClass = errorClass,
       messageParameters = messageParameters)
   }
+
+  /**
+   * Resolves [[UnresolvedProcedure]] for `CALL` / `DESCRIBE PROCEDURE` using the same multipart
+   * candidates as SQL functions and relations ([[resolutionCandidates]] /
+   * [[sqlResolutionPathEntriesForAnalysis]]). Catalogs that do not implement
+   * [[ProcedureCatalog]] are skipped for unqualified names; an explicitly catalog-qualified name
+   * that targets a non-[[ProcedureCatalog]] still raises
+   * [[QueryCompilationErrors.missingCatalogProceduresAbilityError]].
+   */
+  def resolveProcedure(unresolved: UnresolvedProcedure): LogicalPlan = {
+    val candidates = resolutionCandidates(unresolved.nameParts)
+    val skipCandidateFailures = unresolved.nameParts.length == 1
+    for (multipart <- candidates) {
+      val expandedOpt =
+        try {
+          Some(relationResolution.expandIdentifier(multipart))
+        } catch {
+          case NonFatal(_) => None
+        }
+      expandedOpt.foreach { expanded =>
+        CatalogAndIdentifier.unapply(expanded).foreach { case (catalog, ident) =>
+          catalog match {
+            case pc: ProcedureCatalog =>
+              try {
+                val procedure = pc.loadProcedure(ident)
+                return ResolvedProcedure(pc, ident, procedure)
+              } catch {
+                // ProcedureCatalog has no standard "not found" exception type today. For
+                // unqualified names searched through PATH, treat candidate failures as misses and
+                // continue to the next entry (matching table/function PATH iteration semantics).
+                // Explicitly catalog-qualified names still preserve existing error behavior.
+                case _: AnalysisException if skipCandidateFailures =>
+                case _: SparkThrowable if skipCandidateFailures =>
+                case NonFatal(_) if skipCandidateFailures =>
+                case e: AnalysisException => throw e
+                case e: SparkThrowable => throw e
+                case NonFatal(e) =>
+                  val cause = e match {
+                    case ex: Exception => ex
+                    case th => new RuntimeException(th)
+                  }
+                  throw QueryCompilationErrors.failedToLoadRoutineError(
+                    catalog.name +: ident.asMultipartIdentifier,
+                    cause)
+              }
+            case _ =>
+              if (unresolved.nameParts.length > 1 &&
+                  catalogManager.isCatalogRegistered(unresolved.nameParts.head) &&
+                  catalog.name().equalsIgnoreCase(unresolved.nameParts.head)) {
+                throw QueryCompilationErrors.missingCatalogProceduresAbilityError(catalog)
+              }
+          }
+        }
+      }
+    }
+    throw QueryCompilationErrors.unresolvedRoutineError(
+      unresolved.nameParts,
+      sqlResolutionPathEntriesForAnalysis.map(toSQLId),
+      unresolved.origin)
+  }
 }
 
 /**
@@ -596,16 +761,17 @@ object FunctionResolution {
    * @return true if qualified with the given namespace and has a non-empty function name
    */
   private def isQualifiedWithSystemNamespace(nameParts: Seq[String], namespace: String): Boolean = {
-    nameParts.length match {
-      case 2 =>
-        // Format: namespace.funcName (e.g., "builtin.abs")
-        nameParts.head.equalsIgnoreCase(namespace) && nameParts.last.nonEmpty
-      case 3 =>
-        // Format: system.namespace.funcName (e.g., "system.builtin.abs")
-        nameParts(0).equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME) &&
+    val n = nameParts.length
+    if (n == 2) {
+      // Format: namespace.funcName (e.g., "builtin.abs")
+      nameParts.head.equalsIgnoreCase(namespace) && nameParts.last.nonEmpty
+    } else if (n == 3) {
+      // Format: system.namespace.funcName (e.g., "system.builtin.abs")
+      nameParts(0).equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME) &&
         nameParts(1).equalsIgnoreCase(namespace) &&
         nameParts(2).nonEmpty
-      case _ => false
+    } else {
+      false
     }
   }
 
@@ -619,6 +785,6 @@ object FunctionResolution {
    */
   def isUnqualifiedOrBuiltinFunctionName(nameParts: Seq[String], expectedName: String): Boolean = {
     nameParts.lastOption.exists(_.equalsIgnoreCase(expectedName)) &&
-      (nameParts.size == 1 || maybeBuiltinFunctionName(nameParts))
+      (nameParts.length == 1 || maybeBuiltinFunctionName(nameParts))
   }
 }

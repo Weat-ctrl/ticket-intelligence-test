@@ -22,7 +22,7 @@ import java.net.URI
 import java.nio.file.{Files, Paths, StandardCopyOption}
 import java.sql.{Date, Timestamp}
 import java.time.{LocalDate, LocalDateTime}
-import java.util.UUID
+import java.util.{Collections => JCollections, UUID}
 
 import scala.jdk.CollectionConverters._
 
@@ -38,13 +38,13 @@ import org.apache.spark.TestUtils.assertExceptionMsg
 import org.apache.spark.sql._
 import org.apache.spark.sql.TestingUDT.IntervalData
 import org.apache.spark.sql.avro.AvroCompressionCodec._
-import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Literal}
 import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{withDefaultTimeZone, LA, UTC}
 import org.apache.spark.sql.execution.{FormattedMode, SparkPlan}
 import org.apache.spark.sql.execution.datasources.{CommonFileDataSourceSuite, DataSource, FilePartition}
-import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
+import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, FileDataSourceV2, FileTable}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.LegacyBehaviorPolicy
 import org.apache.spark.sql.internal.LegacyBehaviorPolicy._
@@ -52,11 +52,11 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.v2.avro.AvroScan
+import org.apache.spark.unsafe.types.TimestampNanosVal
 import org.apache.spark.util.Utils
 
 abstract class AvroSuite
-  extends QueryTest
-  with SharedSparkSession
+  extends SharedSparkSession
   with CommonFileDataSourceSuite
   with NestedDataSourceSuiteBase {
 
@@ -3192,6 +3192,46 @@ abstract class AvroSuite
     }
   }
 
+  test("SPARK-57166: nanosecond timestamp types are not supported in Avro") {
+    val nanosTypes = Seq(TimestampNTZNanosType(9), TimestampLTZNanosType(9))
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      nanosTypes.foreach { nanosType =>
+        val expectedType = s""""${nanosType.sql}""""
+        withTempDir { dir =>
+          // Write path: a nanos-typed column cannot be written. The nanos literal is built
+          // directly from its internal value to avoid relying on cast/parser support.
+          val nanosLiteral = Literal.create(new TimestampNanosVal(0L, 0.toShort), nanosType)
+          val df = spark.range(1).select(Column(nanosLiteral).as("ts"))
+          val writeDir = new File(dir, "write").getCanonicalPath
+          checkError(
+            exception = intercept[AnalysisException] {
+              df.write.format("avro").mode("overwrite").save(writeDir)
+            },
+            condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+            parameters = Map(
+              "columnName" -> "`ts`",
+              "columnType" -> expectedType,
+              "format" -> "Avro"))
+
+          // Read path: a user-specified nanos schema is rejected. Write a benign file first
+          // so schema validation (not file listing) is what fails.
+          val readDir = new File(dir, "read").getCanonicalPath
+          Seq("a").toDF("ts").write.format("avro").mode("overwrite").save(readDir)
+          checkError(
+            exception = intercept[AnalysisException] {
+              spark.read.schema(new StructType().add("ts", nanosType))
+                .format("avro").load(readDir).collect()
+            },
+            condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
+            parameters = Map(
+              "columnName" -> "`ts`",
+              "columnType" -> expectedType,
+              "format" -> "Avro"))
+        }
+      }
+    }
+  }
+
 }
 
 class AvroV1Suite extends AvroSuite {
@@ -3481,6 +3521,18 @@ class AvroV2Suite extends AvroSuite with ExplainSuiteHelper {
       // Verify data integrity
       checkAnswer(readDf, df)
     }
+  }
+
+  test("SPARK-56457: Avro V2 formatName matches V1 FileFormat.toString") {
+    val v2Provider = DataSource.lookupDataSourceV2("avro", spark.sessionState.conf)
+    assert(v2Provider.isDefined)
+    val dsV2 = v2Provider.get.asInstanceOf[FileDataSourceV2]
+    val v1Format = dsV2.fallbackFileFormat.getDeclaredConstructor().newInstance()
+    val emptyProps = JCollections.emptyMap[String, String]()
+    val v2Table = dsV2.getTable(
+      new StructType(), Array.empty, emptyProps).asInstanceOf[FileTable]
+    assert(v2Table.formatName == v1Format.toString,
+      s"V2 formatName '${v2Table.formatName}' != V1 toString '${v1Format.toString}'")
   }
 
   test("Geospatial types are not supported in Avro") {

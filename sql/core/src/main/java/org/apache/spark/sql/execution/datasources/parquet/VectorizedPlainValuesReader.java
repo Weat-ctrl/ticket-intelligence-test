@@ -72,9 +72,23 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
       c.putBooleans(rowId, i, currentByte, bitOffset);
       bitOffset = (bitOffset + i) & 7;
     }
-    for (; i + 7 < total; i += 8) {
-      updateCurrentByte();
-      c.putBooleans(rowId + i, currentByte);
+    // Batch-read all full bytes in a single getBuffer call instead of per-byte in.read().
+    // getBuffer returns a slice with position=0 and remaining=fullBytes.
+    int fullBytes = (total - i) / 8;
+    if (fullBytes > 0) {
+      ByteBuffer buffer = getBuffer(fullBytes);
+      if (buffer.hasArray()) {
+        byte[] array = buffer.array();
+        int offset = buffer.arrayOffset() + buffer.position();
+        for (int j = 0; j < fullBytes; j++) {
+          c.putBooleans(rowId + i + j * 8, array[offset + j]);
+        }
+      } else {
+        for (int j = 0; j < fullBytes; j++) {
+          c.putBooleans(rowId + i + j * 8, buffer.get());
+        }
+      }
+      i += fullBytes * 8;
     }
     if (i < total) {
       updateCurrentByte();
@@ -139,6 +153,54 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
     ByteBuffer buffer = getBuffer(requiredBytes);
     for (int i = 0; i < total; i += 1) {
       c.putLong(rowId + i, Integer.toUnsignedLong(buffer.getInt()));
+    }
+  }
+
+  @Override
+  public final void readIntegersAsLongs(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 4;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (int32) and target (int64) have different byte
+    // widths so a contiguous byte copy is impossible. Matches the pattern in peer
+    // type-converting bulk methods such as `readUnsignedIntegers`.
+    for (int i = 0; i < total; i += 1) {
+      c.putLong(rowId + i, buffer.getInt());
+    }
+  }
+
+  @Override
+  public final void readIntegersAsDoubles(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 4;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (int32) and target (double, 8 bytes) have
+    // different widths so a contiguous byte copy is impossible. Matches the pattern in
+    // `readIntegersAsLongs` and `readUnsignedIntegers`.
+    for (int i = 0; i < total; i += 1) {
+      c.putDouble(rowId + i, buffer.getInt());
+    }
+  }
+
+  @Override
+  public final void readFloatsAsDoubles(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 4;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (float, 4 bytes) and target (double, 8 bytes)
+    // have different widths so a contiguous byte copy is impossible. Matches the pattern
+    // in `readIntegersAsLongs`.
+    for (int i = 0; i < total; i += 1) {
+      c.putDouble(rowId + i, buffer.getFloat());
+    }
+  }
+
+  @Override
+  public final void readLongsAsInts(int total, WritableColumnVector c, int rowId) {
+    int requiredBytes = total * 8;
+    ByteBuffer buffer = getBuffer(requiredBytes);
+    // No `hasArray` bulk-copy path: source (int64, 8 bytes) and target (int32, 4 bytes)
+    // have different widths so a contiguous byte copy is impossible. Matches the pattern
+    // in `readIntegersAsLongs`.
+    for (int i = 0; i < total; i += 1) {
+      c.putInt(rowId + i, (int) buffer.getLong());
     }
   }
 
@@ -461,9 +523,9 @@ public class VectorizedPlainValuesReader extends ValuesReader implements Vectori
       if (buffer.hasArray()) {
         v.putByteArray(rowId + i, buffer.array(), buffer.arrayOffset() + buffer.position(), len);
       } else {
-        byte[] bytes = new byte[len];
-        buffer.get(bytes);
-        v.putByteArray(rowId + i, bytes);
+        // Copy directly from the ByteBuffer into the column vector's backing storage,
+        // bypassing any intermediate byte[] allocation.
+        v.putByteArray(rowId + i, buffer, buffer.position(), len);
       }
     }
   }

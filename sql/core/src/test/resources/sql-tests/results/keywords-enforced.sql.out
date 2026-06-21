@@ -7,6 +7,7 @@ struct<keyword:string,reserved:boolean>
 ADD	false
 AFTER	false
 AGGREGATE	false
+ALIGN	false
 ALL	true
 ALTER	false
 ALWAYS	false
@@ -15,6 +16,7 @@ AND	true
 ANTI	false
 ANY	true
 ANY_VALUE	false
+APPROX	false
 ARCHIVE	false
 ARRAY	false
 AS	true
@@ -24,10 +26,15 @@ AT	false
 ATOMIC	false
 AUTHORIZATION	true
 BEGIN	false
+BERNOULLI	false
 BETWEEN	false
 BIGINT	false
+BIN	false
 BINARY	false
 BINDING	false
+BIN_DISTRIBUTE_RATIO	false
+BIN_END	false
+BIN_START	false
 BOOLEAN	false
 BOTH	true
 BUCKET	false
@@ -43,6 +50,7 @@ CAST	true
 CATALOG	false
 CATALOGS	false
 CHANGE	false
+CHANGES	false
 CHAR	false
 CHARACTER	false
 CHECK	true
@@ -53,6 +61,7 @@ CLUSTERED	false
 CODEGEN	false
 COLLATE	true
 COLLATION	true
+COLLATIONS	true
 COLLECTION	false
 COLUMN	true
 COLUMNS	false
@@ -72,7 +81,10 @@ CREATE	true
 CROSS	true
 CUBE	false
 CURRENT	false
+CURRENT_DATABASE	false
 CURRENT_DATE	true
+CURRENT_PATH	true
+CURRENT_SCHEMA	true
 CURRENT_TIME	true
 CURRENT_TIMESTAMP	true
 CURRENT_USER	true
@@ -93,6 +105,7 @@ DEC	false
 DECIMAL	false
 DECLARE	false
 DEFAULT	false
+DEFAULT_PATH	false
 DEFINED	false
 DEFINER	false
 DELAY	false
@@ -104,6 +117,7 @@ DETERMINISTIC	false
 DFS	false
 DIRECTORIES	false
 DIRECTORY	false
+DISTANCE	false
 DISTINCT	true
 DISTRIBUTE	false
 DIV	false
@@ -117,9 +131,11 @@ ENFORCED	false
 ESCAPE	true
 ESCAPED	false
 EVOLUTION	false
+EXACT	false
 EXCEPT	true
 EXCHANGE	false
 EXCLUDE	false
+EXCLUSIVE	false
 EXECUTE	true
 EXISTS	false
 EXIT	false
@@ -168,6 +184,7 @@ IMMEDIATE	false
 IMPORT	false
 IN	true
 INCLUDE	false
+INCLUSIVE	false
 INCREMENT	false
 INDEX	false
 INDEXES	false
@@ -235,6 +252,7 @@ NAMESPACES	false
 NANOSECOND	false
 NANOSECONDS	false
 NATURAL	true
+NEAREST	false
 NEXT	false
 NO	false
 NONE	false
@@ -262,6 +280,7 @@ OVERWRITE	false
 PARTITION	false
 PARTITIONED	false
 PARTITIONS	false
+PATH	false
 PERCENT	false
 PIVOT	false
 PLACING	false
@@ -273,6 +292,7 @@ PROCEDURE	false
 PROCEDURES	false
 PROPERTIES	false
 PURGE	false
+QUALIFY	false
 QUARTER	false
 QUERY	false
 RANGE	false
@@ -321,6 +341,7 @@ SET	false
 SETS	false
 SHORT	false
 SHOW	false
+SIMILARITY	false
 SINGLE	false
 SKEWED	false
 SMALLINT	false
@@ -343,6 +364,8 @@ STRUCT	false
 SUBSTR	false
 SUBSTRING	false
 SYNC	false
+SYSTEM	false
+SYSTEM_PATH	false
 SYSTEM_TIME	false
 SYSTEM_VERSION	false
 TABLE	true
@@ -374,6 +397,7 @@ TYPE	false
 UNARCHIVE	false
 UNBOUNDED	false
 UNCACHE	false
+UNIFORM	false
 UNION	true
 UNIQUE	true
 UNKNOWN	true
@@ -401,6 +425,7 @@ WEEKS	false
 WHEN	true
 WHERE	true
 WHILE	false
+WIDTH	false
 WINDOW	false
 WITH	true
 WITHIN	true
@@ -428,11 +453,14 @@ CAST
 CHECK
 COLLATE
 COLLATION
+COLLATIONS
 COLUMN
 CONSTRAINT
 CREATE
 CROSS
 CURRENT_DATE
+CURRENT_PATH
+CURRENT_SCHEMA
 CURRENT_TIME
 CURRENT_TIMESTAMP
 CURRENT_USER

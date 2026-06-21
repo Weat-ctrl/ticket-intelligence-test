@@ -212,6 +212,10 @@ abstract class FsHistoryProviderSuite extends SparkFunSuite with Matchers with P
       SparkListenerApplicationEnd(2L)
       )
     logFile2.setReadable(false, false)
+    // setReadable(false) is a no-op for root users since they bypass file
+    // permission checks. Skip the test in that case.
+    assume(!logFile2.canRead, "Test requires the file to be unreadable; " +
+      "skipping when running as root.")
 
     updateAndCheck(provider) { list =>
       list.size should be (1)
@@ -1031,6 +1035,83 @@ abstract class FsHistoryProviderSuite extends SparkFunSuite with Matchers with P
     freshUI.get.ui.store.job(0)
   }
 
+  test("stale disk store is rebuilt after app completes when UI was evicted from cache") {
+    // Test for the following race condition:
+    //
+    // 1. An in-progress app's UI is loaded -> disk store built from the .inprogress snapshot.
+    // 2. ApplicationCache evicts the UI entry (LRU pressure) -> onUIDetached() is called with
+    //    loadedUI.valid == true (app not yet complete) -> dm.release(delete=false) -> disk store
+    //    is kept on disk, entry removed from activeUIs.
+    // 3. App completes, checkForLogs() detects the completed log, mergeApplicationListing() calls
+    //    invalidateUI() but finds nothing in activeUIs -> the stale disk store is never deleted.
+    // 4. Next getAppUI() reopens the stale disk store from the .inprogress snapshot, missing
+    //    events written after the snapshot (e.g. JobStart, ApplicationEnd).
+    //
+    // The fix: when mergeApplicationListing() processes a completed log and the UI is not in
+    // activeUIs, proactively call dm.release(delete=true) to delete the stale disk store.
+    withTempDir { storeDir =>
+      val conf = createTestConf().set(LOCAL_STORE_DIR, storeDir.getAbsolutePath())
+      val provider = new FsHistoryProvider(conf)
+      val appId = "new1"
+
+      // Step 1: Write an in-progress log containing only ApplicationStart (no job).
+      val inProgressLog = newLogFile(appId, None, inProgress = true)
+      writeFile(inProgressLog, None,
+        SparkListenerApplicationStart(appId, Some(appId), 1L, "test", None)
+      )
+      provider.checkForLogs()
+
+      // Step 2: Load the app UI; this builds the disk store from the in-progress snapshot.
+      val firstUI = provider.getAppUI(appId, None)
+      assert(firstUI.isDefined)
+      // No job exists in the in-progress snapshot.
+      intercept[NoSuchElementException] { firstUI.get.ui.store.job(0) }
+
+      // Step 3: Simulate ApplicationCache LRU eviction BEFORE the app completes.
+      // onUIDetached() is called with loadedUI.valid == true -> dm.release(delete=false):
+      // the disk store is kept but the entry is removed from activeUIs.
+      provider.onUIDetached(appId, None, firstUI.get.ui)
+
+      // Key invariant: after LRU eviction, valid is still true because the app has not
+      // completed yet. This is the heart of the bug: onUIDetached called
+      // dm.release(delete=false) because valid==true at eviction time.
+      assert(firstUI.get.valid)
+
+      // Step 4: Complete the app. Write a new log file (without .inprogress suffix) that
+      // contains ApplicationStart + JobStart + ApplicationEnd, and delete the old one.
+      val completedLog = newLogFile(appId, None, inProgress = false)
+      writeFile(completedLog, None,
+        SparkListenerApplicationStart(appId, Some(appId), 1L, "test", None),
+        SparkListenerJobStart(0, 1L, Nil, null),
+        SparkListenerApplicationEnd(5L)
+      )
+      inProgressLog.delete()
+
+      // Step 5: checkForLogs() detects the completed log.
+      // With the fix, mergeApplicationListing() proactively deletes the stale disk store
+      // because activeUIs is empty (the entry was already evicted in step 3).
+      provider.checkForLogs()
+
+      // Step 6: Load the UI again.
+      // WITHOUT the fix: loadDiskStore() would find the old .ldb dir and reopen it ->
+      //   stale snapshot -> no job data -> ui.store.job(0) throws NoSuchElementException.
+      // WITH the fix: the old disk store was deleted in step 5 -> rebuilt from the completed
+      //   log -> job data is present.
+      val freshUI = provider.getAppUI(appId, None)
+      assert(freshUI.isDefined)
+
+      // The refreshed UI must contain job data from the completed log.
+      freshUI.get.ui.store.job(0)
+
+      // The attempt must be marked as completed in the listing.
+      val appInfo = provider.getListing().toSeq
+      assert(appInfo.size === 1)
+      assert(appInfo.head.attempts.head.completed)
+
+      provider.onUIDetached(appId, None, freshUI.get.ui)
+    }
+  }
+
   test("clean up stale app information") {
     withTempDir { storeDir =>
       val conf = createTestConf().set(LOCAL_STORE_DIR, storeDir.getAbsolutePath())
@@ -1674,6 +1755,38 @@ abstract class FsHistoryProviderSuite extends SparkFunSuite with Matchers with P
 
         provider.stop()
       }
+    }
+  }
+
+  test("SPARK-56278: On-demand loading populates accurate metadata via mergeApplicationListing") {
+    withTempDir { dir =>
+      val conf = createTestConf(true)
+      conf.set(HISTORY_LOG_DIR, dir.getAbsolutePath)
+      conf.set(EVENT_LOG_ROLLING_ON_DEMAND_LOAD_ENABLED, true)
+      val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+      val provider = new FsHistoryProvider(conf)
+
+      val writer = new RollingEventLogFilesWriter("app1", None, dir.toURI, conf, hadoopConf)
+      writer.start()
+      writeEventsToRollingWriter(writer, Seq(
+        SparkListenerApplicationStart("app1", Some("app1"), 1000, "testuser", None),
+        SparkListenerJobStart(1, 0, Seq.empty),
+        SparkListenerApplicationEnd(5000)), rollFile = false)
+      writer.stop()
+
+      // On-demand load without prior scan
+      assert(provider.getAppUI("app1", None).isDefined)
+
+      // Listing should have accurate metadata from mergeApplicationListing,
+      // not dummy values (sparkVersion="unknown", sparkUser="spark", etc.)
+      val appInfo = provider.getListing().next()
+      assert(appInfo.name === "app1")
+      assert(appInfo.attempts.head.appSparkVersion !== "unknown")
+      assert(appInfo.attempts.head.sparkUser === "testuser")
+      assert(appInfo.attempts.head.completed)
+      assert(appInfo.attempts.head.duration > 0)
+
+      provider.stop()
     }
   }
 
@@ -2374,6 +2487,168 @@ abstract class FsHistoryProviderSuite extends SparkFunSuite with Matchers with P
         app1.attempts.head.logSourceName should be(Some(testDir.getAbsolutePath))
         app2.attempts.head.logSourceName should be(Some(dir2.getAbsolutePath))
       }
+
+      provider.stop()
+    } finally {
+      Utils.deleteRecursively(dir2)
+    }
+  }
+
+  test("SPARK-56234: Skips scanning but on-demand loading still works") {
+    withTempDir { dir =>
+      val conf = createTestConf(true)
+      conf.set(HISTORY_LOG_DIR, dir.getAbsolutePath)
+      conf.set(SCAN_DISABLED_PATH_PATTERNS, Seq("file:.*"))
+      conf.set(EVENT_LOG_ROLLING_ON_DEMAND_LOAD_ENABLED, true)
+      val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+      val provider = new FsHistoryProvider(conf)
+
+      // Write a rolling event log
+      val writer = new RollingEventLogFilesWriter("app1", None, dir.toURI, conf, hadoopConf)
+      writer.start()
+      writeEventsToRollingWriter(writer, Seq(
+        SparkListenerApplicationStart("app1", Some("app1"), 0, "user", None),
+        SparkListenerJobStart(1, 0, Seq.empty)), rollFile = false)
+      writer.stop()
+
+      // Scan should skip this directory -- listing remains empty
+      provider.checkForLogs()
+      assert(provider.getListing().length === 0)
+
+      // On-demand loading should still work
+      assert(provider.getAppUI("app1", None).isDefined)
+      assert(provider.getListing().length === 1)
+
+      // Metadata should be accurate (not dummy) since mergeApplicationListing runs
+      // for scan-disabled directories
+      val appInfo = provider.getListing().next()
+      assert(appInfo.name === "app1")
+      assert(appInfo.attempts.head.appSparkVersion !== "unknown")
+
+      // Subsequent scan should NOT remove the on-demand loaded app (stale protection)
+      provider.checkForLogs()
+      assert(provider.getListing().length === 1)
+
+      provider.stop()
+    }
+  }
+
+  test("SPARK-56234: Scan disabled schemes do not affect directories with non-matching schemes") {
+    withTempDir { dir =>
+      val conf = createTestConf(true)
+      conf.set(HISTORY_LOG_DIR, dir.getAbsolutePath)
+      // Disable scanning for s3a/gs -- should not affect local file:// directories
+      conf.set(SCAN_DISABLED_PATH_PATTERNS, Seq("s3a://.*", "gs://.*"))
+      val provider = new FsHistoryProvider(conf)
+      val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+
+      val writer = new RollingEventLogFilesWriter("app1", None, dir.toURI, conf, hadoopConf)
+      writer.start()
+      writeEventsToRollingWriter(writer, Seq(
+        SparkListenerApplicationStart("app1", Some("app1"), 0, "user", None),
+        SparkListenerJobStart(1, 0, Seq.empty)), rollFile = false)
+      writer.stop()
+
+      // file:// scheme is not disabled, so scanning should work normally
+      provider.checkForLogs()
+      assert(provider.getListing().length === 1)
+
+      provider.stop()
+    }
+  }
+
+  test("SPARK-56234: Scan disabled with empty config does not disable any scheme") {
+    withTempDir { dir =>
+      val conf = createTestConf(true)
+      conf.set(HISTORY_LOG_DIR, dir.getAbsolutePath)
+      conf.set(SCAN_DISABLED_PATH_PATTERNS, Seq.empty[String])
+      val provider = new FsHistoryProvider(conf)
+      val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+
+      val writer = new RollingEventLogFilesWriter("app1", None, dir.toURI, conf, hadoopConf)
+      writer.start()
+      writeEventsToRollingWriter(writer, Seq(
+        SparkListenerApplicationStart("app1", Some("app1"), 0, "user", None),
+        SparkListenerJobStart(1, 0, Seq.empty)), rollFile = false)
+      writer.stop()
+
+      provider.checkForLogs()
+      assert(provider.getListing().length === 1)
+
+      provider.stop()
+    }
+  }
+
+  test("SPARK-56234: On-demand loading populates accurate metadata via mergeApplicationListing") {
+    withTempDir { dir =>
+      val conf = createTestConf(true)
+      conf.set(HISTORY_LOG_DIR, dir.getAbsolutePath)
+      conf.set(SCAN_DISABLED_PATH_PATTERNS, Seq("file:.*"))
+      conf.set(EVENT_LOG_ROLLING_ON_DEMAND_LOAD_ENABLED, true)
+      val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+      val provider = new FsHistoryProvider(conf)
+
+      val writer = new RollingEventLogFilesWriter("app1", None, dir.toURI, conf, hadoopConf)
+      writer.start()
+      writeEventsToRollingWriter(writer, Seq(
+        SparkListenerApplicationStart("app1", Some("app1"), 1000, "testuser", None),
+        SparkListenerJobStart(1, 0, Seq.empty),
+        SparkListenerApplicationEnd(5000)), rollFile = false)
+      writer.stop()
+
+      // On-demand load without prior scan
+      assert(provider.getAppUI("app1", None).isDefined)
+
+      // Listing should have accurate metadata from mergeApplicationListing,
+      // not dummy values (sparkVersion="unknown", sparkUser="spark", etc.)
+      val appInfo = provider.getListing().next()
+      assert(appInfo.name === "app1")
+      assert(appInfo.attempts.head.appSparkVersion !== "unknown")
+      assert(appInfo.attempts.head.sparkUser === "testuser")
+      assert(appInfo.attempts.head.completed)
+      assert(appInfo.attempts.head.duration > 0)
+
+      provider.stop()
+    }
+  }
+
+  test("SPARK-56234: Scan disabled by path pattern skips matching directories") {
+    val dir2 = Utils.createTempDir(namePrefix = "logDir2")
+    try {
+      val conf = createTestConf(true)
+      conf.set(HISTORY_LOG_DIR, s"${testDir.getAbsolutePath},${dir2.getAbsolutePath}")
+      conf.set(SCAN_DISABLED_PATH_PATTERNS, Seq(s".*${dir2.getName}"))
+      conf.set(EVENT_LOG_ROLLING_ON_DEMAND_LOAD_ENABLED, true)
+      val hadoopConf = SparkHadoopUtil.newConfiguration(conf)
+      val provider = new FsHistoryProvider(conf)
+
+      // Write app in active dir (scan enabled)
+      val writer1 = new RollingEventLogFilesWriter(
+        "app1", None, testDir.toURI, conf, hadoopConf)
+      writer1.start()
+      writeEventsToRollingWriter(writer1, Seq(
+        SparkListenerApplicationStart("app1", Some("app1"), 0, "user", None),
+        SparkListenerJobStart(1, 0, Seq.empty)), rollFile = false)
+      writer1.stop()
+
+      // Write app in archive dir (scan disabled)
+      val writer2 = new RollingEventLogFilesWriter(
+        "app2", None, dir2.toURI, conf, hadoopConf)
+      writer2.start()
+      writeEventsToRollingWriter(writer2, Seq(
+        SparkListenerApplicationStart("app2", Some("app2"), 0, "user", None),
+        SparkListenerJobStart(2, 0, Seq.empty)), rollFile = false)
+      writer2.stop()
+
+      // Only app1 should be discovered by scan
+      provider.checkForLogs()
+      val listing = provider.getListing().toSeq
+      assert(listing.size === 1)
+      assert(listing.head.id === "app1")
+
+      // app2 should be loadable on demand
+      assert(provider.getAppUI("app2", None).isDefined)
+      assert(provider.getListing().toSeq.size === 2)
 
       provider.stop()
     } finally {

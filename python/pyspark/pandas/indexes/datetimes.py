@@ -806,7 +806,7 @@ class DatetimeIndex(Index):
         psdf = psdf.pandas_on_spark.attach_id_column("distributed-sequence", id_column_name)
         with ps.option_context("compute.default_index_type", "distributed"):
             # The attached index in the statement below will be dropped soon,
-            # so we enforce “distributed” default index type
+            # so we enforce "distributed" default index type
             psdf = psdf.pandas_on_spark.apply_batch(pandas_between_time)
         return ps.Index(first_series(psdf).rename(self.name))
 
@@ -851,7 +851,7 @@ class DatetimeIndex(Index):
         psdf = psdf.pandas_on_spark.attach_id_column("distributed-sequence", id_column_name)
         with ps.option_context("compute.default_index_type", "distributed"):
             # The attached index in the statement below will be dropped soon,
-            # so we enforce “distributed” default index type
+            # so we enforce "distributed" default index type
             psdf = psdf.pandas_on_spark.apply_batch(pandas_at_time)
         return ps.Index(first_series(psdf).rename(self.name))
 
@@ -881,7 +881,7 @@ def _test() -> None:
         .appName("pyspark.pandas.indexes.datetimes tests")
         .getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.indexes.datetimes,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

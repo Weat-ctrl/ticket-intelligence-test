@@ -109,9 +109,11 @@ jQuery.extend( jQuery.fn.dataTableExt.ofnSearch, {
   }
 });
 
-$(document).ajaxStop($.unblockUI);
-$(document).ajaxStart(function(){
-  $.blockUI({ message: '<h3>Loading history summary...</h3>'});
+$(document).ajaxStop(function () {
+  $("#loading-overlay").addClass("d-none");
+});
+$(document).ajaxStart(function () {
+  $("#loading-overlay").removeClass("d-none");
 });
 
 $(document).ready(function() {
@@ -255,8 +257,6 @@ $(document).ready(function() {
           'appName:name',
           'logPath:name'
         ];
-      } else {
-        conf.columns = removeColumnByName(conf.columns, attemptIdColumnName);
       }
 
       var defaultSortColumn = completedColumnName;
@@ -264,6 +264,11 @@ $(document).ready(function() {
         defaultSortColumn = startedColumnName;
         conf.columns = removeColumnByName(conf.columns, completedColumnName);
         conf.columns = removeColumnByName(conf.columns, durationColumnName);
+        // Remove the corresponding <th> headers since Mustache conditionals are gone
+        apps.find('th').filter(function() {
+          var text = $(this).text().trim();
+          return text === 'Completed' || text === 'Duration';
+        }).remove();
       }
       conf.order = [[ getColumnIndex(conf.columns, defaultSortColumn), "desc" ]];
       conf.columnDefs = [
